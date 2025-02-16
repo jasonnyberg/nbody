@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>3D N-Body Simulation (Vertex Shader + Transform Feedback)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+
+        #debug {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            font-family: monospace;
+            padding: 10px;
+            max-height: 90vh;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="glcanvas"></canvas>
+    <div id="debug"></div>
+    <div style="position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="gSlider">G: <span id="gValue">0.2</span></label><br>
+        <input type="range" id="gSlider" min="0.01" max="5.0" step="0.01" value="0.2">
+    </div>
+    <div style="position: fixed; top: 60px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="dampingSlider">Damping: <span id="dampingValue">1.0</span></label><br>
+        <input type="range" id="dampingSlider" min="0.0" max="1.0" step="0.01" value="1.0">
+    </div>
+    <div style="position: fixed; top: 110px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="spinSlider">Spin: <span id="spinValue">0.0</span></label><br>
+        <input type="range" id="spinSlider" min="0.0" max="1.0" step="0.01" value="0.0">
+    </div>
+    <script type="text/javascript">
+        "use strict";
+
+        // === WebGL2 Context Setup ===
+        const canvas = document.getElementById("glcanvas");
+        const gl = canvas.getContext("webgl2");
+        if (!gl) {
+            alert("WebGL2 not supported in your browser.");
+            throw new Error("WebGL2 not supported");
+        }
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.disable(gl.DEPTH_TEST);
+
+        // === Simulation Parameters ===
+        const NUM_PARTICLES = 25000; // must be multiple of 100
+        const DT = 0.2;   // time step
+        let G = 0.15;    // gravitational strength
+        const R = 10000.0;    // repulsive strength
+        let spin = 0.03;    // spin acceleration control
+        const EPS = 0.001;  // epsilon to avoid singularities
+        let damping = 1.0;
+        const stride = 4;
+        const radius = 1000.0;
+        const radiation = 0.01;
+        const cam_dist = 1000;
+
+        let loopCount = 0;
+        let startTime = performance.now();
+
+        // Calculate texture dimensions
+        const texHeight = 100;
+        const texWidth = Math.ceil(NUM_PARTICLES / texHeight);
+
+        // === Shader Sources ===
+        const simVsSource = `#version 300 es
+        precision highp float;
+
+        uniform int    u_numParticles;
+        uniform float  u_dt;
+        uniform float  u_G;
+        uniform float  u_R;
+        uniform float  u_spin;
+        uniform float  u_eps;
+        uniform sampler2D u_positionTex;
+        uniform sampler2D u_velocityTex;
+        uniform float  u_damping;
+        float radiate_mag = 0.0;
+
+        out vec4 outPosition;
+        out vec4 outVelocity;
+
+        vec2 coord(int idx) {
+            int x = idx % ${texWidth};
+            int y = idx / ${texWidth};
+            return vec2((float(x) + 0.5) / float(${texWidth}), (float(y) + 0.5) / float(${texHeight}));
+        }
+
+        void main() {
+            int i = gl_VertexID;
+            vec2 uv = coord(i);
+
+            vec3 pos = texture(u_positionTex, uv).xyz;
+            vec3 vel = texture(u_velocityTex, uv).xyz;
+            
+            vec3 force = vec3(0.0);
+            for (int j = 0; j < ${NUM_PARTICLES}; j++) {
+                if(j == i) continue;
+                
+                vec2 uvj = coord(j);
+
+                vec3 posj = texture(u_positionTex, uvj).xyz;
+                vec3 velj = texture(u_velocityTex, uvj).xyz;
+                
+                vec3 diff = posj - pos;
+                float dist = length(diff);
+                
+                // Skip if particles are too close
+                if(dist < u_eps) continue;
+                
+                vec3 dir = diff / dist;
+                
+                float dist2 = dist * dist;
+                float dist6 = dist2 * dist2 * dist2;
+                
+                float attractive = u_G / dist2;
+                float repulsive = u_R / dist6;
+
+                float radiate = 0.0;
+                if (repulsive > attractive) {
+                    float closingSpeed = dot(diff, vel - velj);
+                    radiate = 0.01 * closingSpeed / dist;
+                }
+                
+                float fmag = attractive - repulsive - radiate;
+                radiate_mag += abs(radiate);
+                
+                force += dir * fmag;
+            }
+            
+            // Safe spin force calculation
+            vec2 posXZ = pos.xz;
+            float d = length(posXZ);
+            
+            // Safe normalization for tangent
+            vec2 tangent = vec2(-posXZ.y, posXZ.x);
+            vec3 spinForce = vec3(tangent.x, 0.0, tangent.y) * (u_spin / d);
+            
+            // Clamp spinForce to prevent runaway values
+            spinForce = clamp(spinForce, vec3(-1000.0), vec3(1000.0));
+            
+            force += spinForce;
+            
+            // Update velocity and position with safety checks
+            vel += force * u_dt;
+            vel *= u_damping;
+            pos += vel * u_dt;
+
+            float fi = float(i);
+            outPosition = vec4(pos, radiate_mag);
+            outVelocity = vec4(vel, 0.0);
+            gl_Position = vec4(pos, 0.0);
+        }`;
+
+        const renderVsSource = `#version 300 es
+        precision highp float;
+        in vec4 aPosition;
+        out float v_data;
+        
+        uniform mat4 uProjectionMatrix;
+        uniform mat4 uViewMatrix;
+        
+        void main() {
+            v_data = aPosition.w; // Pass the w component (radiate_mag) to fragment shader
+            vec4 viewPos = uViewMatrix * vec4(aPosition.xyz, 1.0);
+            gl_PointSize = max(2.0, 20.0 * ${cam_dist}.0 / (${cam_dist}.0 - viewPos.z));
+            gl_Position = uProjectionMatrix * viewPos;
+        }`;
+
+        const simFsSource = `#version 300 es
+        precision highp float;
+        out vec4 fragColor;
+        void main() {
+            fragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        }`;
+
+        const renderFsSource = `#version 300 es
+        precision highp float;
+        in float v_data;
+        out vec4 fragColor;
+        void main() {       
+            float rad = clamp(10.0 * v_data, 0.0, 1.0);
+            float r = length(gl_PointCoord * 2.0 - 1.0); // Calculate distance from center of point
+            //if (r > 1.0) discard;  // This creates the circular shape
+            //fragColor = vec4(v_data, 1.0, 1.0, 1.0 - r); // Circular particle with soft edges
+            fragColor = vec4(rad, 0.5, 1.0 - rad, smoothstep(0.7, 0.0, r)); // Circular particle with soft edges
+        }`;
+
+        // === Utility Functions ===
+        function compileShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error("Shader compile error:", gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vsSource, fsSource, varyings) {
+            const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+            const program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            if (varyings) {
+                gl.transformFeedbackVaryings(program, varyings, gl.SEPARATE_ATTRIBS);
+            }
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error("Program link error:", gl.getProgramInfoLog(program));
+                return null;
+            }
+            return program;
+        }
+
+        // === Create Programs ===
+        const tfVaryings = ["outPosition", "outVelocity"];
+        const simProgram = createProgram(gl, simVsSource, simFsSource, tfVaryings);
+        const renderProgram = createProgram(gl, renderVsSource, renderFsSource);
+
+        // === Texture Setup ===
+        function createParticleTexture(gl) {
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            return texture;
+        }
+
+        const positionTexA = createParticleTexture(gl);
+        const positionTexB = createParticleTexture(gl);
+        const velocityTexA = createParticleTexture(gl);
+        const velocityTexB = createParticleTexture(gl);
+
+        // Initialize particle data
+        const positionData = new Float32Array(texWidth * texHeight * stride);
+        const velocityData = new Float32Array(texWidth * texHeight * stride);
+
+        for (let i = 0; i < NUM_PARTICLES; i++) {
+            const texIndex = i * stride;
+            let x, y, z;
+            do {
+                x = (Math.random() - 0.5) * 2 * radius;
+                y = (Math.random() - 0.5) * 2 * radius;
+                z = (Math.random() - 0.5) * 2 * radius;
+            } while (x * x + y * y + z * z > radius * radius);
+
+            positionData[texIndex + 0] = x;
+            positionData[texIndex + 1] = y;
+            positionData[texIndex + 2] = z;
+
+            velocityData[texIndex + 0] = 0.0;
+            velocityData[texIndex + 1] = 0.0;
+            velocityData[texIndex + 2] = 0.0;
+        }
+
+        function uploadTextureData(gl, texture, data) {
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, texWidth, texHeight, 0, gl.RGBA, gl.FLOAT, data);
+        }
+
+        uploadTextureData(gl, positionTexA, positionData);
+        uploadTextureData(gl, positionTexB, positionData);
+        uploadTextureData(gl, velocityTexA, velocityData);
+        uploadTextureData(gl, velocityTexB, velocityData);
+
+        // === Buffer Setup ===
+        const simulationVAO = gl.createVertexArray();
+        gl.bindVertexArray(simulationVAO);
+
+        // After creating simulationVAO
+        const simulationVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, simulationVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(NUM_PARTICLES * stride), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 16, 0);
+
+        // Initialize with sequential indices
+        const indices = new Float32Array(NUM_PARTICLES * stride);
+        for (let i = 0; i < NUM_PARTICLES; i++) {
+            indices[i * stride] = i;
+        }
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, indices);
+
+        // Create empty VBO for transform feedback
+        const tfPositionBuffer = gl.createBuffer();
+        const tfVelocityBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positionData.byteLength, gl.STREAM_COPY);
+        gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, velocityData.byteLength, gl.STREAM_COPY);
+
+        // Setup transform feedback
+        const transformFeedback = gl.createTransformFeedback();
+        gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, transformFeedback);
+
+        // Make sure we're binding the correct number of components
+        const bufferSize = NUM_PARTICLES * stride * Float32Array.BYTES_PER_ELEMENT;
+
+        // Position buffer
+        gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, bufferSize, gl.STREAM_COPY);
+        gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, tfPositionBuffer);
+
+        // Velocity buffer
+        gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, bufferSize, gl.STREAM_COPY);
+        gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 1, tfVelocityBuffer);
+
+        // === Render Setup ===
+        const renderVAO = gl.createVertexArray();
+        gl.bindVertexArray(renderVAO);
+
+        const renderVBO = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, renderVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, positionData, gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 16, 0);
+
+        // Add after your WebGL context initialization
+        //gl.enable(gl.VERTEX_PROGRAM_POINT_SIZE);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+        // === Camera Matrices ===
+        function perspectiveMatrix(fov, aspect, near, far) {
+            const f = 1.0 / Math.tan(fov / 2);
+            return new Float32Array([
+                f / aspect, 0, 0, 0,
+                0, f, 0, 0,
+                0, 0, (far + near) / (near - far), -1,
+                0, 0, (2 * far * near) / (near - far), 0
+            ]);
+        }
+
+        function lookAt(eye, center, up) {
+            const f = normalize(subtract(center, eye));
+            const s = normalize(cross(f, up));
+            const u = cross(s, f);
+            return new Float32Array([
+                s[0], u[0], -f[0], 0,
+                s[1], u[1], -f[1], 0,
+                s[2], u[2], -f[2], 0,
+                -dot(s, eye), -dot(u, eye), dot(f, eye), 1
+            ]);
+        }
+
+        function subtract(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+        function normalize(v) {
+            const len = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            return [v[0] / len, v[1] / len, v[2] / len];
+        }
+        function cross(a, b) {
+            return [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0]
+            ];
+        }
+        function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+        const projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
+        const viewMatrix = lookAt([0, cam_dist/3, cam_dist], [0, 0, 0], [0, 1, 0]);
+
+        // === State Management ===
+        let currentPositionTex = positionTexA;
+        let currentVelocityTex = velocityTexA;
+        let nextPositionTex = positionTexB;
+        let nextVelocityTex = velocityTexB;
+
+        const gSlider = document.getElementById('gSlider');
+        const gValueDisplay = document.getElementById('gValue');
+        gSlider.addEventListener('input', function (e) {
+            G = parseFloat(e.target.value);
+            gValueDisplay.textContent = G.toFixed(2);
+        });
+
+        const dampingSlider = document.getElementById('dampingSlider');
+        const dampingValueDisplay = document.getElementById('dampingValue');
+        dampingSlider.addEventListener('input', function (e) {
+            damping = parseFloat(e.target.value);
+            dampingValueDisplay.textContent = damping.toFixed(2);
+        });
+
+        const spinSlider = document.getElementById('spinSlider');
+        const spinValueDisplay = document.getElementById('spinValue');
+        spinSlider.addEventListener('input', function (e) {
+            spin = parseFloat(e.target.value);
+            spinValueDisplay.textContent = spin.toFixed(2);
+        });
+
+        function swapState() {
+            [currentPositionTex, nextPositionTex] = [nextPositionTex, currentPositionTex];
+            [currentVelocityTex, nextVelocityTex] = [nextVelocityTex, currentVelocityTex];
+        }
+
+        // === Simulation and Rendering ===
+        function simulate() {
+            gl.useProgram(simProgram);
+            gl.bindVertexArray(simulationVAO);
+
+            // Bind textures
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, currentPositionTex);
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, currentVelocityTex);
+
+            // Set uniforms
+            gl.uniform1i(gl.getUniformLocation(simProgram, "u_positionTex"), 0);
+            gl.uniform1i(gl.getUniformLocation(simProgram, "u_velocityTex"), 1);
+            gl.uniform1i(gl.getUniformLocation(simProgram, "u_numParticles"), NUM_PARTICLES);
+            gl.uniform1f(gl.getUniformLocation(simProgram, "u_dt"), DT);
+            gl.uniform1f(gl.getUniformLocation(simProgram, "u_G"), G);
+            gl.uniform1f(gl.getUniformLocation(simProgram, "u_R"), R);
+            gl.uniform1f(gl.getUniformLocation(simProgram, "u_spin"), spin);
+            gl.uniform1f(gl.getUniformLocation(simProgram, "u_damping"), damping);
+
+            // Transform feedback
+            gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, transformFeedback);
+            gl.enable(gl.RASTERIZER_DISCARD);
+            gl.beginTransformFeedback(gl.POINTS);
+            gl.drawArrays(gl.POINTS, 0, NUM_PARTICLES);
+            gl.endTransformFeedback();
+            gl.disable(gl.RASTERIZER_DISCARD);
+            gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+
+            // Read back the transform feedback data
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, positionData);
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
+
+            // Update the textures with new data
+            uploadTextureData(gl, nextPositionTex, positionData);
+            uploadTextureData(gl, nextVelocityTex, velocityData);
+
+            swapState();
+            // After reading back the transform feedback data
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, positionData);
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
+
+            //console.log(`particle 0 rad: ${positionData[3]}<br>`);
+
+            // Validate data
+            for (let i = 0; i < NUM_PARTICLES * stride; i++) {
+                if (isNaN(positionData[i]) || isNaN(velocityData[i])) {
+                    console.error(`NaN detected at index ${i}, frame ${loopCount}`);
+                    console.error(`Position: ${positionData.slice(i - 3, i + 1)}`);
+                    console.error(`Velocity: ${velocityData.slice(i - 3, i + 1)}`);
+                    // Optionally pause the simulation
+                    // cancelAnimationFrame(animationFrame);
+                    break;
+                }
+            }
+        }
+
+        // Add this function before the render function
+        function formatVector(x, y, z) {
+            return `(${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)})`;
+        }
+
+        // Modify the render function to include debug info
+        function render() {
+            gl.bindBuffer(gl.ARRAY_BUFFER, renderVBO);
+            gl.bufferSubData(gl.ARRAY_BUFFER, 0, positionData);
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+            gl.useProgram(renderProgram);
+            gl.bindVertexArray(renderVAO);
+
+            gl.uniformMatrix4fv(
+                gl.getUniformLocation(renderProgram, "uProjectionMatrix"),
+                false,
+                projMatrix
+            );
+            gl.uniformMatrix4fv(
+                gl.getUniformLocation(renderProgram, "uViewMatrix"),
+                false,
+                viewMatrix
+            );
+
+            gl.drawArrays(gl.POINTS, 0, NUM_PARTICLES);
+
+            /////////////// Debug visualization ///////////////
+            const debugDiv = document.getElementById('debug');
+
+            const currentTime = performance.now();
+            const elapsedSeconds = (currentTime - startTime) / 1000;
+            const fps = loopCount / elapsedSeconds;
+
+            let debugText = '<strong>Simulation Stats:</strong><br>';
+            debugText += `Frame: ${loopCount}<br>`;
+            debugText += `Runtime: ${elapsedSeconds.toFixed(1)}s<br>`;
+            debugText += `FPS: ${fps.toFixed(1)}<br>`;
+
+            // Only show first 5 particles to avoid overwhelming the display
+            const particlesToShow = Math.min(1 /*5*/, NUM_PARTICLES);
+            for (let i = 0; i < particlesToShow; i++) {
+                const idx = i * stride;
+                const pos = formatVector(
+                    positionData[idx],
+                    positionData[idx + 1],
+                    positionData[idx + 2]
+                );
+                const vel = formatVector(
+                    velocityData[idx],
+                    velocityData[idx + 1],
+                    velocityData[idx + 2]
+                );
+
+                debugText += `<br>Particle ${i}:<br>`;
+                debugText += `  Pos: ${pos}<br>`;
+                debugText += `  Vel: ${vel}<br>`;
+                debugText += `  Rad: ${positionData[idx  + 3]}<br>`;
+            }
+
+            // Add some statistics
+            let avgSpeed = 0;
+            let maxSpeed = 0;
+            let avgDist = 0;
+
+            for (let i = 0; i < NUM_PARTICLES; i++) {
+                const idx = i * stride;
+                const speed = Math.sqrt(
+                    velocityData[idx] * velocityData[idx] +
+                    velocityData[idx + 1] * velocityData[idx + 1] +
+                    velocityData[idx + 2] * velocityData[idx + 2]
+                );
+                const dist = Math.sqrt(
+                    positionData[idx] * positionData[idx] +
+                    positionData[idx + 1] * positionData[idx + 1] +
+                    positionData[idx + 2] * positionData[idx + 2]
+                );
+
+                avgSpeed += speed;
+                maxSpeed = Math.max(maxSpeed, speed);
+                avgDist += dist;
+            }
+
+            avgSpeed /= NUM_PARTICLES;
+            avgDist /= NUM_PARTICLES;
+
+            debugText += `<br><strong>Statistics:</strong><br>`;
+            debugText += `Avg Speed: ${avgSpeed.toFixed(2)}<br>`;
+            debugText += `Max Speed: ${maxSpeed.toFixed(2)}<br>`;
+            debugText += `Avg Distance from Center: ${avgDist.toFixed(2)}<br>`;
+
+            debugDiv.innerHTML = debugText;
+        }
+
+        // === Animation Loop ===
+        function loop() {
+            if (loopCount == 100)
+                spin = 0.0;
+            simulate();
+            render();
+            loopCount++;
+            requestAnimationFrame(loop);
+        }
+        loop();
+    </script>
+</body>
+
+</html>
