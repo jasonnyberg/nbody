@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8">
+    <title>N-Body Simulation with Attractive and Repulsive Forces</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+
+        #ui {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(255, 255, 255, 0.8);
+            padding: 10px;
+            border-radius: 8px;
+            z-index: 100;
+            font-family: sans-serif;
+            font-size: 12px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+        }
+
+        input[type=range] {
+            width: 150px;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- UI Controls for tuning force parameters -->
+    <div id="ui">
+        <label>
+            Gravitational Strength (G):
+            <input id="gravStrength" type="range" min="0.0" max="1" step="0.01" value="0.03">
+            <span id="gravValue">0.03</span>
+        </label>
+        <label>
+            Repulsive Strength (R):
+            <input id="repelStrength" type="range" min="0" max="1000" step="1" value="200">
+            <span id="repelValue">200</span>
+        </label>
+        <label>
+            Damping:
+            <input id="damping" type="range" min="0.0" max="1.0" step="0.01" value="0.5">
+            <span id="dampingValue">0.5</span>
+        </label>
+        <label>
+            TimeStep:
+            <input id="dt" type="range" min="0.0" max="1.0" step="0.01" value="1">
+            <span id="dtValue">1</span>
+        </label>
+        <label>
+            Spin:
+            <input id="spin" type="range" min="0.0" max="0.5" step="0.001" value="0">
+            <span id="spinValue">0</span>
+        </label>
+    </div>
+
+    <!-- Include Three.js from a CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // --- Simulation Parameters ---
+        let G = parseFloat(document.getElementById('gravStrength').value); // gravitational constant (attractive)
+        let R = parseFloat(document.getElementById('repelStrength').value); // repulsive constant
+        let damping = parseFloat(document.getElementById('damping').value);
+        let dt = parseFloat(document.getElementById('dt').value);
+        let spin = parseFloat(document.getElementById('spin').value);
+
+        // Update UI display and parameters when sliders change
+        document.getElementById('gravStrength').addEventListener('input', function () {
+            G = parseFloat(this.value);
+            document.getElementById('gravValue').textContent = this.value;
+        });
+        document.getElementById('repelStrength').addEventListener('input', function () {
+            R = parseFloat(this.value);
+            document.getElementById('repelValue').textContent = this.value;
+        });
+        document.getElementById('damping').addEventListener('input', function () {
+            damping = parseFloat(this.value);
+            document.getElementById('dampingValue').textContent = this.value;
+        });
+        document.getElementById('dt').addEventListener('input', function () {
+            dt = parseFloat(this.value);
+            document.getElementById('dtValue').textContent = this.value;
+        });
+        document.getElementById('spin').addEventListener('input', function () {
+            spin = parseFloat(this.value);
+            document.getElementById('spinValue').textContent = this.value;
+        });
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(
+            90, window.innerWidth / window.innerHeight, 0.1, 1000
+        );
+        camera.position.z = 300;
+
+        const renderer = new THREE.WebGLRenderer();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Create Bodies ---
+        const numBodies = 2000;  // you can adjust the number of bodies here
+        const bodies = [];
+        // Use a simple sphere geometry for each body
+        const bodyGeometry = new THREE.SphereGeometry(0.5, 5, 5);
+        const bodyMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+
+        for (let i = 0; i < numBodies; i++) {
+                // Create position vector
+                const position = new THREE.Vector3(
+                    (Math.random() - 0.5) * 40,
+                    (Math.random() - 0.5) * 40,
+                    (Math.random() - 0.5) * 40
+                );
+
+            const body = {
+                mass: 1,  // assuming unit mass for simplicity
+                position: position,
+                velocity: new THREE.Vector3(0.0, 0.0, 0.0),
+                force: new THREE.Vector3(0.0, 0.0, 0.0)
+            };
+
+            body.mesh = new THREE.Mesh(bodyGeometry, bodyMaterial);
+            body.mesh.position.copy(body.position);
+            scene.add(body.mesh);
+            bodies.push(body);
+        }
+
+        // --- Simulation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // For each body, compute the net force from all other bodies.
+            for (let i = 0; i < bodies.length; i++) {
+                for (let j = i+1; j < bodies.length; j++) {
+                    // Calculate the vector from bodies[i] to bodies[j]
+                    const diff = new THREE.Vector3().subVectors(bodies[j].position, bodies[i].position);
+                    const distance = diff.length();
+
+                    // Avoid division by zero or extremely close distances
+                    if (distance < 0.001) continue;
+
+                    const d2 = distance * distance;
+                    const direction = diff.clone().normalize();
+                    const attractive = G / d2;
+                    repulsive = R / (d2 * d2 * d2);
+
+                    if (repulsive > attractive) {
+                        const closingSpeed = diff.dot(bodies[i].velocity.clone().sub(bodies[j].velocity));
+                        repulsive = repulsive + (.01 * closingSpeed / distance)
+                    }
+
+                    // Multiply the unit direction by the net force magnitude.
+                    bodies[i].force.addScaledVector(direction, attractive - repulsive);
+                    bodies[j].force.addScaledVector(direction, repulsive - attractive);
+                }
+            }
+
+            // Update the positions of the meshes for rendering.
+            bodies.forEach(body => {
+                // Update the velocity and position of the body (assuming unit mass)
+
+                // Calculate distance from origin
+                const distanceFromOrigin = body.position.length();
+
+                // Create a velocity vector perpendicular to position
+                // Using cross product with a standard axis will create a perpendicular vector
+                const velocity = new THREE.Vector3().crossVectors(body.position, new THREE.Vector3(0, 1, 1)).normalize();
+
+                // Scale velocity based on distance (linear falloff)
+                const velocityMagnitude = spin / distanceFromOrigin;
+                body.velocity.add(velocity.multiplyScalar(velocityMagnitude));
+
+                body.velocity.add(body.force.multiplyScalar(dt));
+                body.velocity.multiplyScalar(damping);
+                body.position.add(body.velocity.clone().multiplyScalar(dt));
+                body.mesh.position.copy(body.position);
+                body.force.set(0, 0, 0);
+            });
+
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        // Handle window resizing
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+/*
+// N-Body Simulation with Attractive and Repulsive Forces
+
+// Simulation Parameters (can be adjusted)
+const float G = 0.03;          // Gravitational Strength 
+const float R = 200.0;         // Repulsive Strength
+const float DAMPING = 0.5;     // Velocity Damping
+const float TIME_STEP = 1.0;   // Time Step
+const float SPIN = 0.0;        // Spin Intensity
+
+// Pseudo-random number generator
+float rand(vec2 co) {
+    return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+// Initialize a body with random position and zero velocity
+void initBody(int index, out vec4 pos, out vec4 vel) {
+    float seed = float(index);
+    pos = vec4(
+        (rand(vec2(seed, 0.0)) - 0.5) * 40.0,
+        (rand(vec2(seed, 1.0)) - 0.5) * 40.0,
+        (rand(vec2(seed, 2.0)) - 0.5) * 40.0,
+        1.0  // Mass
+    );
+    vel = vec4(0.0, 0.0, 0.0, 0.0);
+}
+
+// Main render function
+void mainImage( out vec4 fragColor, in vec2 fragCoord )
+{
+    // Normalized pixel coordinates (from 0 to 1)
+    vec2 uv = fragCoord/iResolution.xy;
+    
+    // Number of bodies
+    const int NUM_BODIES = 2000;
+    
+    // Buffers for position and velocity
+    // We'll use multiple render passes to simulate the simulation
+    vec4 positions[NUM_BODIES];
+    vec4 velocities[NUM_BODIES];
+    
+    // Initialize bodies on first frame
+    if (iFrame == 0) {
+        for (int i = 0; i < NUM_BODIES; i++) {
+            initBody(i, positions[i], velocities[i]);
+        }
+    }
+    
+    // Simulation step
+    for (int i = 0; i < NUM_BODIES; i++) {
+        vec3 force = vec3(0.0);
+        
+        // Compute forces from other bodies
+        for (int j = 0; j < NUM_BODIES; j++) {
+            if (i == j) continue;
+            
+            // Calculate distance and direction
+            vec3 diff = positions[j].xyz - positions[i].xyz;
+            float distance = length(diff);
+            
+            // Avoid division by zero
+            if (distance < 0.001) continue;
+            
+            // Compute attractive and repulsive forces
+            float d2 = distance * distance;
+            vec3 direction = normalize(diff);
+            float attractive = G / d2;
+            float repulsive = R / (d2 * d2 * d2);
+            
+            // Adjust force based on relative velocities
+            if (repulsive > attractive) {
+                float closingSpeed = dot(diff, velocities[i].xyz - velocities[j].xyz);
+                repulsive += 0.01 * closingSpeed / distance;
+            }
+            
+            // Accumulate force
+            force += direction * (attractive - repulsive);
+        }
+        
+        // Add spin effect
+        float distanceFromOrigin = length(positions[i].xyz);
+        vec3 spinVelocity = normalize(cross(positions[i].xyz, vec3(0.0, 1.0, 1.0)));
+        spinVelocity *= SPIN / max(distanceFromOrigin, 0.1);
+        
+        // Update velocity and position
+        velocities[i].xyz += force * TIME_STEP;
+        velocities[i].xyz *= DAMPING;
+        velocities[i].xyz += spinVelocity;
+        positions[i].xyz += velocities[i].xyz * TIME_STEP;
+    }
+    
+    // Visualization (simple color based on position)
+    vec3 color = vec3(
+        abs(sin(positions[int(uv.x * float(NUM_BODIES))].x)),
+        abs(cos(positions[int(uv.y * float(NUM_BODIES))].y)),
+        0.5
+    );
+    
+    // Output to screen
+    fragColor = vec4(color, 1.0);
+}
+*/
+
+    </script>
+</body>
+
+</html>
