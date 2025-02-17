@@ -448,7 +448,36 @@
             gl.disable(gl.RASTERIZER_DISCARD);
             gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
 
+            // Read back the transform feedback data
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, positionData);
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
+
+            // Update the textures with new data
+            uploadTextureData(gl, nextPositionTex, positionData);
+            uploadTextureData(gl, nextVelocityTex, velocityData);
+
             swapState();
+            // After reading back the transform feedback data
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, positionData);
+            gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
+            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
+
+            //console.log(`particle 0 rad: ${positionData[3]}<br>`);
+
+            // Validate data
+            for (let i = 0; i < NUM_PARTICLES * stride; i++) {
+                if (isNaN(positionData[i]) || isNaN(velocityData[i])) {
+                    console.error(`NaN detected at index ${i}, frame ${loopCount}`);
+                    console.error(`Position: ${positionData.slice(i - 3, i + 1)}`);
+                    console.error(`Velocity: ${velocityData.slice(i - 3, i + 1)}`);
+                    // Optionally pause the simulation
+                    // cancelAnimationFrame(animationFrame);
+                    break;
+                }
+            }
         }
 
         // Add this function before the render function
@@ -492,8 +521,10 @@
             debugText += `Runtime: ${elapsedSeconds.toFixed(1)}s<br>`;
             debugText += `FPS: ${fps.toFixed(1)}<br>`;
 
+
+            /*
             // Only show first 5 particles to avoid overwhelming the display
-            const particlesToShow = Math.min(1 /*5*/, NUM_PARTICLES);
+            const particlesToShow = Math.min(1, NUM_PARTICLES);
             for (let i = 0; i < particlesToShow; i++) {
                 const idx = i * stride;
                 const pos = formatVector(
@@ -512,8 +543,6 @@
                 debugText += `  Vel: ${vel}<br>`;
                 debugText += `  Rad: ${positionData[idx  + 3]}<br>`;
             }
-
-            /*
 
             // Add some statistics
             let avgSpeed = 0;
