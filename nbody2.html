@@ -62,23 +62,22 @@
         gl.disable(gl.DEPTH_TEST);
 
         // === Simulation Parameters ===
-        const NUM_PARTICLES = 25000; // must be multiple of 100
-        const DT = 0.2;   // time step
-        let G = 0.15;    // gravitational strength
+        const NUM_PARTICLES = 256*100; // must be multiple of 100
+        const DT = 0.1;   // time step
+        let G = 0.2;    // gravitational strength
         const R = 10000.0;    // repulsive strength
-        let spin = 0.03;    // spin acceleration control
+        let spin = 0.00;    // spin acceleration control
         const EPS = 0.001;  // epsilon to avoid singularities
         let damping = 1.0;
         const stride = 4;
         const radius = 1000.0;
-        const radiation = 0.01;
         const cam_dist = 1000;
 
         let loopCount = 0;
         let startTime = performance.now();
 
         // Calculate texture dimensions
-        const texHeight = 100;
+        const texHeight = 256;
         const texWidth = Math.ceil(NUM_PARTICLES / texHeight);
 
         // === Shader Sources ===
@@ -165,10 +164,9 @@
             vel *= u_damping;
             pos += vel * u_dt;
 
-            float fi = float(i);
             outPosition = vec4(pos, radiate_mag);
+          outPosition = vec4(float(2*i/256+10), float(2*i%256), float(i/100+300), float(i)/25000.0);
             outVelocity = vec4(vel, 0.0);
-            gl_Position = vec4(pos, 0.0);
         }`;
 
         const renderVsSource = `#version 300 es
@@ -182,8 +180,8 @@
         void main() {
             v_data = aPosition.w; // Pass the w component (radiate_mag) to fragment shader
             vec4 viewPos = uViewMatrix * vec4(aPosition.xyz, 1.0);
-            gl_PointSize = max(2.0, 20.0 * ${cam_dist}.0 / (${cam_dist}.0 - viewPos.z));
             gl_Position = uProjectionMatrix * viewPos;
+            gl_PointSize = max(2.0, 5000.0 / gl_Position.z);
         }`;
 
         const simFsSource = `#version 300 es
@@ -198,10 +196,9 @@
         in float v_data;
         out vec4 fragColor;
         void main() {
-            float rad = clamp(10.0 * v_data, 0.0, 1.0);
+            float rad = clamp(1.0 * v_data, 0.0, 1.0);
             float r = length(gl_PointCoord * 2.0 - 1.0); // Calculate distance from center of point
-            //if (r > 1.0) discard;  // This creates the circular shape
-            //fragColor = vec4(v_data, 1.0, 1.0, 1.0 - r); // Circular particle with soft edges
+            if (r > 1.0) discard;  // This creates the circular shape
             fragColor = vec4(rad, 0.5, 1.0 - rad, smoothstep(0.7, 0.0, r)); // Circular particle with soft edges
         }`;
 
@@ -341,8 +338,6 @@
         gl.enableVertexAttribArray(0);
         gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 16, 0);
 
-        // Add after your WebGL context initialization
-        //gl.enable(gl.VERTEX_PROGRAM_POINT_SIZE);
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
@@ -466,7 +461,7 @@
             gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
 
             //console.log(`particle 0 rad: ${positionData[3]}<br>`);
-
+            /*
             // Validate data
             for (let i = 0; i < NUM_PARTICLES * stride; i++) {
                 if (isNaN(positionData[i]) || isNaN(velocityData[i])) {
@@ -478,6 +473,7 @@
                     break;
                 }
             }
+            */
         }
 
         // Add this function before the render function
