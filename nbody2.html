@@ -197,7 +197,7 @@
         precision highp float;
         in float v_data;
         out vec4 fragColor;
-        void main() {       
+        void main() {
             float rad = clamp(10.0 * v_data, 0.0, 1.0);
             float r = length(gl_PointCoord * 2.0 - 1.0); // Calculate distance from center of point
             //if (r > 1.0) discard;  // This creates the circular shape
@@ -448,36 +448,7 @@
             gl.disable(gl.RASTERIZER_DISCARD);
             gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
 
-            // Read back the transform feedback data
-            gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
-            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, positionData);
-            gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
-            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
-
-            // Update the textures with new data
-            uploadTextureData(gl, nextPositionTex, positionData);
-            uploadTextureData(gl, nextVelocityTex, velocityData);
-
             swapState();
-            // After reading back the transform feedback data
-            gl.bindBuffer(gl.ARRAY_BUFFER, tfPositionBuffer);
-            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, positionData);
-            gl.bindBuffer(gl.ARRAY_BUFFER, tfVelocityBuffer);
-            gl.getBufferSubData(gl.ARRAY_BUFFER, 0, velocityData);
-
-            //console.log(`particle 0 rad: ${positionData[3]}<br>`);
-
-            // Validate data
-            for (let i = 0; i < NUM_PARTICLES * stride; i++) {
-                if (isNaN(positionData[i]) || isNaN(velocityData[i])) {
-                    console.error(`NaN detected at index ${i}, frame ${loopCount}`);
-                    console.error(`Position: ${positionData.slice(i - 3, i + 1)}`);
-                    console.error(`Velocity: ${velocityData.slice(i - 3, i + 1)}`);
-                    // Optionally pause the simulation
-                    // cancelAnimationFrame(animationFrame);
-                    break;
-                }
-            }
         }
 
         // Add this function before the render function
@@ -542,6 +513,8 @@
                 debugText += `  Rad: ${positionData[idx  + 3]}<br>`;
             }
 
+            /*
+
             // Add some statistics
             let avgSpeed = 0;
             let maxSpeed = 0;
@@ -572,6 +545,7 @@
             debugText += `Avg Speed: ${avgSpeed.toFixed(2)}<br>`;
             debugText += `Max Speed: ${maxSpeed.toFixed(2)}<br>`;
             debugText += `Avg Distance from Center: ${avgDist.toFixed(2)}<br>`;
+            */
 
             debugDiv.innerHTML = debugText;
         }
