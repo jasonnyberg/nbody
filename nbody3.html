@@ -79,12 +79,12 @@
 
         // ---- Simulation Parameters ----
         const NUM_PARTICLES = 256*100; // Total number of particles
-        const DT = 0.1; // time step
+        const DT = 0.2; // time step
         let G = 0.2; // gravitational strength
         const R = 10000.0; // repulsive strength
-        let spin = 0.00; // spin control
+        let spin = 0.03; // spin control
         const EPS = 0.001; // epsilon
-        let damping = 1.0;
+        let damping = 0.9;
         const stride = 4;
         const radius = 1000.0;
         const cam_dist = 1000;
@@ -167,9 +167,9 @@
         // Fill the remaining texels with zero (if any)
         // Create two ping-pong pairs:
         let posTexA = createStateTexture(gl, texWidth, texHeight, posData);
-        let posTexB = createStateTexture(gl, texWidth, texHeight, posData);
+        let posTexB = createStateTexture(gl, texWidth, texHeight, null);
         let velTexA = createStateTexture(gl, texWidth, texHeight, velData);
-        let velTexB = createStateTexture(gl, texWidth, texHeight, velData);
+        let velTexB = createStateTexture(gl, texWidth, texHeight, null);
 
         // ---- Create FBO for Simulation Update (MRT) ----
         const simFBO = gl.createFramebuffer();
@@ -225,7 +225,6 @@
           int idx = pixel.y * int(u_texWidth) + pixel.x;
           vec2 uv = vec2((float(pixel.x) + 0.5) / u_texWidth, (float(pixel.y) + 0.5) / u_texHeight);
 
-          /*
           // For texels that do not correspond to an active particle,
           // simply copy the current state to avoid clobbering data.
           if (idx >= u_numParticles) {
@@ -233,7 +232,6 @@
               outVelocity = texture(u_velocityTex, uv);
               return;
           }
-          */
 
           vec3 pos = texture(u_positionTex, uv).xyz;
           vec3 vel = texture(u_velocityTex, uv).xyz;
@@ -279,7 +277,6 @@
           pos += vel * u_dt;
           
           outPosition = vec4(pos, radiate_mag);
-          outPosition = vec4(float(2*idx/256+10), float(2*idx%256), float(idx/100+300), float(idx)/25000.0);
           outVelocity = vec4(vel, 1.0);
       }`;
 
@@ -331,7 +328,7 @@
       in float radiate_mag;
       out vec4 fragColor;
       void main() {
-          float rad = clamp(1.0 * radiate_mag, 0.0, 1.0);
+          float rad = clamp(10.0 * radiate_mag, 0.0, 1.0);
           float r = length(gl_PointCoord * 2.0 - 1.0); // Calculate distance from center of point
           if (r > 1.0) discard; // This creates the circular shape
           fragColor = vec4(rad, 0.5, 1.0 - rad, smoothstep(0.7, 0.0, r)); // Circular particle with soft edges
@@ -353,7 +350,7 @@
         gl.bufferData(gl.ARRAY_BUFFER, particleUVs, gl.STATIC_DRAW);
         const uvLoc = gl.getAttribLocation(renderProgram, "a_uv");
         gl.enableVertexAttribArray(uvLoc);
-        gl.vertexAttribPointer(uvLoc, 4, gl.FLOAT, false, 16, 0);
+        gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 0, 0);
         gl.bindVertexArray(null);
 
         // ---- Create Projection and View Matrices (simple perspective camera) ----
@@ -503,7 +500,9 @@
 
         // ---- Animation Loop ----
         function loop() {
-            if (loopCount == 100)
+            if (loopCount == 10)
+                damping = 1.0;
+            if (loopCount == 150)
                 spin = 0.0;
             updateSimulation();
             render();
