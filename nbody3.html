@@ -8,31 +8,11 @@
 
 <head>
     <meta charset="UTF-8">
-    <title>3D N-Body Simulation – Direct GPU Ping-Pong</title>
+    <title>3D N-Body Simulation – WebGPU</title>
     <style>
-        body {
-            margin: 0;
-            overflow: hidden;
-        }
-
-        canvas {
-            width: 100vw;
-            height: 100vh;
-            display: block;
-        }
-
-        #debug {
-            position: fixed;
-            top: 10px;
-            left: 10px;
-            background: rgba(0, 0, 0, 0.7);
-            color: white;
-            font-family: monospace;
-            padding: 10px;
-            max-height: 90vh;
-            overflow-y: auto;
-            font-size: 12px;
-        }
+        body { margin: 0; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #debug { position: fixed; top: 10px; left: 10px; background: rgba(0,0,0,0.7); color: white; font-family: monospace; padding: 10px; max-height: 90vh; overflow-y: auto; font-size: 12px; }
     </style>
 </head>
 
@@ -51,316 +31,62 @@
         <label for="spinSlider">Spin: <span id="spinValue">0.0</span></label><br>
         <input type="range" id="spinSlider" min="0.0" max="1.0" step="0.01" value="0.0">
     </div>
+
     <script type="text/javascript">
-        "use strict";
+    "use strict";
 
-        // === WebGL2 Context Setup ===
+    (async () => {
         const canvas = document.getElementById("glcanvas");
-        const gl = canvas.getContext("webgl2");
-        if (!gl) {
-            alert("WebGL2 not supported");
-            throw new Error("No WebGL2");
+        const debugDiv = document.getElementById('debug');
+
+        if (!('gpu' in navigator)) {
+            alert('WebGPU not supported in this browser.');
+            return;
         }
 
-        // Request the EXT_float_blend extension
-        const floatBlendExt = gl.getExtension('EXT_float_blend');
-        if (!floatBlendExt) {
-            alert("EXT_float_blend not supported");
-            throw new Error("EXT_float_blend not supported");
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) { alert('Failed to get GPU adapter'); return; }
+        const device = await adapter.requestDevice();
+        const context = canvas.getContext('webgpu');
+        const format = navigator.gpu.getPreferredCanvasFormat();
+
+        function resizeCanvas() {
+            const dpr = Math.max(1, window.devicePixelRatio || 1);
+            canvas.width = Math.floor(canvas.clientWidth * dpr);
+            canvas.height = Math.floor(canvas.clientHeight * dpr);
+            context.configure({ device, format, alphaMode: 'premultiplied' });
         }
-
-        const colorBufferFloatExt = gl.getExtension('EXT_color_buffer_float');
-        if (!colorBufferFloatExt) {
-            alert("EXT_color_buffer_float not supported");
-            throw new Error("EXT_color_buffer_float not supported");
-        }
-
-        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-        canvas.width = window.innerWidth;
-        canvas.height = window.innerHeight;
-        gl.viewport(0, 0, canvas.width, canvas.height);
-        gl.disable(gl.DEPTH_TEST);
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
 
         // ---- Simulation Parameters ----
-        const NUM_PARTICLES = 256*100; // Total number of particles
-        const DT = 0.2; // time step
-        let G = 0.2; // gravitational strength
-        const R = 10000.0; // repulsive strength
-        let spin = 0.03; // spin control
-        const EPS = 0.001; // epsilon
+        const NUM_PARTICLES = 256*100; // must be multiple of 100 per original
+        const DT = 0.2;
+        let G = 0.2;
+        const R = 10000.0;
+        let spin = 0.03;
+        const EPS = 0.001;
         let damping = 0.9;
-        const stride = 4;
+        const stride = 4; // vec4 per particle
         const radius = 1000.0;
-        const cam_dist = 1000;
-
+        const cam_dist = 1000.0;
         let loopCount = 0;
-        let startTime = performance.now();
+        const startTime = performance.now();
 
-        // We'll pack our particles into a texture. Choose a texture size that can hold NUM_PARTICLES.
-        // For example, if we choose a height of 100, then width = ceil(NUM_PARTICLES/100)
-        const texHeight = 256;
-        const texWidth = Math.ceil(NUM_PARTICLES / texHeight);
+        // UI wiring
+        const gSlider = document.getElementById('gSlider');
+        const gValueDisplay = document.getElementById('gValue');
+        gSlider.addEventListener('input', (e) => { G = parseFloat(e.target.value); gValueDisplay.textContent = G.toFixed(2); writeSimParams(); });
+        const dampingSlider = document.getElementById('dampingSlider');
+        const dampingValueDisplay = document.getElementById('dampingValue');
+        dampingSlider.addEventListener('input', (e) => { damping = parseFloat(e.target.value); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); });
+        const spinSlider = document.getElementById('spinSlider');
+        const spinValueDisplay = document.getElementById('spinValue');
+        spinSlider.addEventListener('input', (e) => { spin = parseFloat(e.target.value); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); });
 
-        // ---- Utility: Shader Compilation ----
-        function compileShader(gl, type, source) {
-            const shader = gl.createShader(type);
-            gl.shaderSource(shader, source);
-            gl.compileShader(shader);
-            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-                console.error("Shader compile error:", gl.getShaderInfoLog(shader));
-                gl.deleteShader(shader);
-                return null;
-            }
-            return shader;
-        }
-        function createProgram(gl, vsSource, fsSource, attribs) {
-            const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
-            const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
-            const program = gl.createProgram();
-            gl.attachShader(program, vs);
-            gl.attachShader(program, fs);
-            if (attribs) {
-                for (let i = 0; i < attribs.length; i++) {
-                    gl.bindAttribLocation(program, i, attribs[i]);
-                }
-            }
-            gl.linkProgram(program);
-            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-                console.error("Program link error:", gl.getProgramInfoLog(program));
-                return null;
-            }
-            return program;
-        }
-
-        // ---- Create Floating-Point Textures for Particle State ----
-        function createStateTexture(gl, width, height, data) {
-            const tex = gl.createTexture();
-            gl.bindTexture(gl.TEXTURE_2D, tex);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0,
-                gl.RGBA, gl.FLOAT, data);
-            return tex;
-        }
-
-        // Each particle stores (x,y,z) for position and (x,y,z) for velocity.
-        // We pack them into RGBA: for position, we use (x,y,z,extra) and for velocity (x,y,z,1.0)
-        const posData = new Float32Array(texWidth * texHeight * stride);
-        const velData = new Float32Array(texWidth * texHeight * stride);
-        for (let i = 0; i < NUM_PARTICLES; i++) {
-            const ti = i * stride;
-            // Random position inside a sphere
-            let x, y, z;
-            do {
-                x = (Math.random() - 0.5) * 2 * radius;
-                y = (Math.random() - 0.5) * 2 * radius;
-                z = (Math.random() - 0.5) * 2 * radius;
-            } while (x * x + y * y + z * z > radius * radius);
-            posData[ti + 0] = x;
-            posData[ti + 1] = y;
-            posData[ti + 2] = z;
-            posData[ti + 3] = 0.0;
-
-            velData[ti + 0] = 0.0;
-            velData[ti + 1] = 0.0;
-            velData[ti + 2] = 0.0;
-            velData[ti + 3] = 1.0;
-        }
-        // Fill the remaining texels with zero (if any)
-        // Create two ping-pong pairs:
-        let posTexA = createStateTexture(gl, texWidth, texHeight, posData);
-        let posTexB = createStateTexture(gl, texWidth, texHeight, null);
-        let velTexA = createStateTexture(gl, texWidth, texHeight, velData);
-        let velTexB = createStateTexture(gl, texWidth, texHeight, null);
-
-        // ---- Create FBO for Simulation Update (MRT) ----
-        const simFBO = gl.createFramebuffer();
-
-        // ---- Full-Screen Quad for Simulation Update ----
-        const quadVS = `#version 300 es
-      precision highp float;
-      // Vertex positions for a full-screen quad.
-      const vec2 pos[6] = vec2[](
-          vec2(-1.0, -1.0),
-          vec2( 1.0, -1.0),
-          vec2(-1.0, 1.0),
-          vec2(-1.0, 1.0),
-          vec2( 1.0, -1.0),
-          vec2( 1.0, 1.0)
-      );
-      out vec2 v_uv;
-      void main() {
-          gl_Position = vec4(pos[gl_VertexID], 0.0, 1.0);
-          // Map from [-1,1] to [0,1]
-          v_uv = pos[gl_VertexID] * 0.5 + 0.5;
-      }`;
-
-        const simFS = `#version 300 es
-      precision highp float;
-      in vec2 v_uv;
-
-      uniform int u_numParticles;
-      uniform float u_dt;
-      uniform float u_G;
-      uniform float u_R;
-      uniform float u_spin;
-      uniform float u_eps;
-      uniform float u_texWidth;
-      uniform float u_texHeight;
-      uniform sampler2D u_positionTex;
-      uniform sampler2D u_velocityTex;
-      uniform float  u_damping;
-
-      // We'll output new state via MRT.
-      layout(location = 0) out vec4 outPosition;
-      layout(location = 1) out vec4 outVelocity;
-
-      // Given an integer index, compute the texture coordinate.
-      vec2 coord(int idx) {
-          int x = idx % int(u_texWidth);
-          int y = idx / int(u_texWidth);
-          return vec2((float(x) + 0.5) / u_texWidth, (float(y) + 0.5) / u_texHeight);
-      }
-
-      void main() {
-          ivec2 pixel = ivec2(v_uv * vec2(u_texWidth, u_texHeight));
-          int idx = pixel.y * int(u_texWidth) + pixel.x;
-          vec2 uv = vec2((float(pixel.x) + 0.5) / u_texWidth, (float(pixel.y) + 0.5) / u_texHeight);
-
-          // For texels that do not correspond to an active particle,
-          // simply copy the current state to avoid clobbering data.
-          if (idx >= u_numParticles) {
-              outPosition = texture(u_positionTex, uv);
-              outVelocity = texture(u_velocityTex, uv);
-              return;
-          }
-
-          vec3 pos = texture(u_positionTex, uv).xyz;
-          vec3 vel = texture(u_velocityTex, uv).xyz;
-          vec3 force = vec3(0.0);
-          float radiate_mag = 0.0;
-
-          // Note: This loop is O(n) per particle; at 25,000 particles it can be very heavy.
-          for (int j = 0; j < u_numParticles; j++) {
-              if(j == idx) continue;
-              vec2 uvj = coord(j);
-              vec3 posj = texture(u_positionTex, uvj).xyz;
-              vec3 velj = texture(u_velocityTex, uvj).xyz;
-              vec3 diff = posj - pos;
-              float dist = length(diff);
-              if(dist < u_eps) continue;
-              vec3 dir = diff / dist;
-              float attractive = u_G / (dist * dist);
-              float repulsive = u_R / pow(dist, 6.0);
-
-              float radiate = 0.0;
-              if (repulsive > attractive) {
-                  float closingSpeed = dot(diff, vel - velj);
-                  radiate = 0.01 * closingSpeed / dist;
-              }
-
-              float fmag = attractive - repulsive - radiate;
-              radiate_mag += abs(radiate);
-
-              force += dir * fmag;
-          }            
-          
-          // Spin force in the XZ plane:
-          vec2 posXZ = pos.xz;
-          float d = length(posXZ);
-          vec2 tangent = vec2(-posXZ.y, posXZ.x);
-          vec3 spinForce = vec3(tangent.x, 0.0, tangent.y) * (u_spin / d);
-
-          force += spinForce;
-          
-          // Update velocity and position.
-          vel += force * u_dt;
-          vel *= u_damping;
-          pos += vel * u_dt;
-          
-          outPosition = vec4(pos, radiate_mag);
-          outVelocity = vec4(vel, 1.0);
-      }`;
-
-        const simProgram = createProgram(gl, quadVS, simFS);
-        // Get uniform locations for simulation update shader.
-        const simUniforms = {
-            u_numParticles: gl.getUniformLocation(simProgram, "u_numParticles"),
-            u_dt: gl.getUniformLocation(simProgram, "u_dt"),
-            u_G: gl.getUniformLocation(simProgram, "u_G"),
-            u_R: gl.getUniformLocation(simProgram, "u_R"),
-            u_spin: gl.getUniformLocation(simProgram, "u_spin"),
-            u_eps: gl.getUniformLocation(simProgram, "u_eps"),
-            u_damping: gl.getUniformLocation(simProgram, "u_damping"),
-            u_texWidth: gl.getUniformLocation(simProgram, "u_texWidth"),
-            u_texHeight: gl.getUniformLocation(simProgram, "u_texHeight"),
-            u_positionTex: gl.getUniformLocation(simProgram, "u_positionTex"),
-            u_velocityTex: gl.getUniformLocation(simProgram, "u_velocityTex")
-        };
-
-        // ---- Set Up a VAO for the full-screen quad (no attributes needed) ----
-        const quadVAO = gl.createVertexArray();
-        gl.bindVertexArray(quadVAO);
-        // We can use gl.drawArrays with gl_VertexID
-        gl.bindVertexArray(null);
-
-        // ---- Render Shader: Render particles as points ----
-        const renderVS = `#version 300 es
-      precision highp float;
-      in vec2 a_uv;
-      out float radiate_mag;
-      uniform sampler2D u_positionTex;
-      uniform float u_texWidth;
-      uniform float u_texHeight;
-      uniform mat4 u_projection;
-      uniform mat4 u_view;
-      // We'll compute the particle index from the uv.
-      void main() {
-          // Compute the particle index from a_uv (each vertex corresponds to a particle)
-          ivec2 pixel = ivec2(a_uv * vec2(u_texWidth, u_texHeight));
-          vec2 uv = vec2((float(pixel.x)+0.5)/u_texWidth, (float(pixel.y)+0.5)/u_texHeight);
-          vec4 posData = texture(u_positionTex, uv);
-          vec3 pos = posData.xyz;         // Use these for transforming the vertex.
-          radiate_mag = posData.w;        // Use this for any extra effect (e.g., color, size, etc.)
-          gl_Position = u_projection * u_view * vec4(pos, 1.0);
-          gl_PointSize = max(2.0, 5000.0 / gl_Position.z);
-      }`;
-        const renderFS = `#version 300 es
-      precision highp float;
-      in float radiate_mag;
-      out vec4 fragColor;
-      void main() {
-          float rad = clamp(10.0 * radiate_mag, 0.0, 1.0);
-          float r = length(gl_PointCoord * 2.0 - 1.0); // Calculate distance from center of point
-          if (r > 1.0) discard; // This creates the circular shape
-          fragColor = vec4(rad, 0.5, 1.0 - rad, smoothstep(0.7, 0.0, r)); // Circular particle with soft edges
-      }`;
-        const renderProgram = createProgram(gl, renderVS, renderFS, ["a_uv"]);
-        // Prepare a VBO that covers the simulation texture size (each texel is one particle)
-        const particleUVs = new Float32Array(texWidth * texHeight * 2);
-        for (let y = 0; y < texHeight; y++) {
-            for (let x = 0; x < texWidth; x++) {
-                const i = (y * texWidth + x) * 2;
-                particleUVs[i + 0] = (x + 0.5) / texWidth;
-                particleUVs[i + 1] = (y + 0.5) / texHeight;
-            }
-        }
-        const renderVAO = gl.createVertexArray();
-        gl.bindVertexArray(renderVAO);
-        const uvBuffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, particleUVs, gl.STATIC_DRAW);
-        const uvLoc = gl.getAttribLocation(renderProgram, "a_uv");
-        gl.enableVertexAttribArray(uvLoc);
-        gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 0, 0);
-        gl.bindVertexArray(null);
-
-        // ---- Create Projection and View Matrices (simple perspective camera) ----
-        function perspective(fovy, aspect, near, far) {
-            const f = 1.0 / Math.tan(fovy / 2);
+        // ---- Helpers ----
+        function perspectiveMatrix(fov, aspect, near, far) {
+            const f = 1.0 / Math.tan(fov / 2);
             const nf = 1 / (near - far);
             return new Float32Array([
                 f / aspect, 0, 0, 0,
@@ -380,141 +106,364 @@
                 -dot(s, eye), -dot(u, eye), dot(f, eye), 1
             ]);
         }
-        function subtract(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
-        function normalize(v) {
-            const len = Math.hypot(v[0], v[1], v[2]);
-            return [v[0] / len, v[1] / len, v[2] / len];
-        }
-        function cross(a, b) {
-            return [a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0]];
-        }
-        function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+        function subtract(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+        function normalize(v) { const l = Math.hypot(v[0], v[1], v[2]); return [v[0]/l, v[1]/l, v[2]/l]; }
+        function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+        function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
 
-        const projMat = perspective(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
-        const viewMat = lookAt([0, cam_dist / 3, cam_dist], [0, 0, 0], [0, 1, 0]);
+        let projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
+        let viewMatrix = lookAt([0, cam_dist/3, cam_dist], [0, 0, 0], [0, 1, 0]);
 
-        const gSlider = document.getElementById('gSlider');
-        const gValueDisplay = document.getElementById('gValue');
-        gSlider.addEventListener('input', function (e) {
-            G = parseFloat(e.target.value);
-            gValueDisplay.textContent = G.toFixed(2);
+        // ---- GPU Buffers (positions/velocities ping-pong) ----
+        const particleCount = NUM_PARTICLES;
+        const stateByteSize = particleCount * stride * 4; // 4 bytes per float
+        function createBufferFromArray(arr, usage) {
+            const buffer = device.createBuffer({ size: arr.byteLength, usage, mappedAtCreation: true });
+            new Float32Array(buffer.getMappedRange()).set(arr);
+            buffer.unmap();
+            return buffer;
+        }
+        function createEmptyBuffer(size, usage) {
+            return device.createBuffer({ size, usage });
+        }
+
+        // Initialize CPU-side state
+        const posInit = new Float32Array(particleCount * stride);
+        const velInit = new Float32Array(particleCount * stride);
+        for (let i = 0; i < particleCount; i++) {
+            const ti = i * stride;
+            let x, y, z;
+            do {
+                x = (Math.random() - 0.5) * 2 * radius;
+                y = (Math.random() - 0.5) * 2 * radius;
+                z = (Math.random() - 0.5) * 2 * radius;
+            } while (x*x + y*y + z*z > radius*radius);
+            posInit[ti+0] = x; posInit[ti+1] = y; posInit[ti+2] = z; posInit[ti+3] = 0.0; // radiate accumulator
+            velInit[ti+0] = 0.0; velInit[ti+1] = 0.0; velInit[ti+2] = 0.0; velInit[ti+3] = 0.0;
+        }
+
+        let posA = createBufferFromArray(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        let posB = createEmptyBuffer(stateByteSize, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+        let velA = createBufferFromArray(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        let velB = createEmptyBuffer(stateByteSize, GPUBufferUsage.STORAGE);
+
+        // ---- Uniform Buffers ----
+        // Sim params: [dt, G, R, spin, eps, damping, numParticlesF, pad]
+        const simParamsData = new Float32Array([DT, G, R, spin, EPS, damping, particleCount, 0]);
+        const simParamsBuffer = device.createBuffer({ size: simParamsData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        function writeSimParams() {
+            simParamsData[0] = DT;
+            simParamsData[1] = G;
+            simParamsData[2] = R;
+            simParamsData[3] = spin;
+            simParamsData[4] = EPS;
+            simParamsData[5] = damping;
+            simParamsData[6] = particleCount;
+            device.queue.writeBuffer(simParamsBuffer, 0, simParamsData.buffer, simParamsData.byteOffset, simParamsData.byteLength);
+        }
+        writeSimParams();
+
+        // Matrices + viewport: projection(16) + view(16) + viewportSize(2) + sizeScale + pad = 36 floats
+        const matricesData = new Float32Array(36);
+        function writeMatrices() {
+            matricesData.set(projMatrix, 0);
+            matricesData.set(viewMatrix, 16);
+            matricesData[32] = canvas.width;
+            matricesData[33] = canvas.height;
+            matricesData[34] = 5000.0; // size scale (matches WebGL version)
+            matricesData[35] = 0.0;     // pad
+            device.queue.writeBuffer(matricesBuffer, 0, matricesData.buffer, matricesData.byteOffset, matricesData.byteLength);
+        }
+        const matricesBuffer = device.createBuffer({ size: matricesData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        writeMatrices();
+
+        // ---- Shaders (WGSL) ----
+        const computeWGSL = /* wgsl */`
+struct SimParams {
+  dt: f32;
+  G: f32;
+  R: f32;
+  spin: f32;
+  eps: f32;
+  damping: f32;
+  numParticlesF: f32;
+  _pad: f32;
+};
+
+@group(0) @binding(0) var<storage, read> posIn: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> velIn: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> posOut: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> velOut: array<vec4<f32>>;
+@group(0) @binding(4) var<uniform> params: SimParams;
+
+const TILE_SIZE: u32 = 256u;
+var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
+var<workgroup> tileVel: array<vec4<f32>, TILE_SIZE>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id)  lid: vec3<u32>) {
+  let i: u32 = gid.x;
+  let n: u32 = u32(params.numParticlesF);
+  let active: bool = i < n;
+
+  var pos: vec3<f32> = vec3<f32>(0.0);
+  var vel: vec3<f32> = vec3<f32>(0.0);
+  if (active) {
+    pos = posIn[i].xyz;
+    vel = velIn[i].xyz;
+  }
+
+  var force: vec3<f32> = vec3<f32>(0.0);
+  var radiate_mag: f32 = 0.0;
+
+  var base: u32 = 0u;
+  loop {
+    if (base >= n) { break; }
+
+    // Load a tile of j-particles into shared memory
+    let jIndex = base + lid.x;
+    if (jIndex < n) {
+      tilePos[lid.x] = posIn[jIndex];
+      tileVel[lid.x] = velIn[jIndex];
+    } else {
+      tilePos[lid.x] = vec4<f32>(0.0);
+      tileVel[lid.x] = vec4<f32>(0.0);
+    }
+    workgroupBarrier();
+
+    let remaining = n - base;
+    let tileCount: u32 = select(TILE_SIZE, remaining, remaining < TILE_SIZE);
+
+    if (active) {
+      var k: u32 = 0u;
+      loop {
+        if (k >= tileCount) { break; }
+        let jGlobal = base + k;
+        if (jGlobal != i) {
+          let pj = tilePos[k].xyz;
+          let vj = tileVel[k].xyz;
+          let diff = pj - pos;
+          let dist = length(diff);
+          if (dist >= params.eps) {
+            let dir = diff / dist;
+            let dist2 = dist * dist;
+            let dist6 = dist2 * dist2 * dist2;
+            let attractive = params.G / dist2;
+            let repulsive  = params.R / dist6;
+            var radiate: f32 = 0.0;
+            if (repulsive > attractive) {
+              let closingSpeed = dot(diff, vel - vj);
+              radiate = 0.01 * closingSpeed / dist;
+            }
+            let fmag = attractive - repulsive - radiate;
+            radiate_mag = radiate_mag + abs(radiate);
+            force = force + dir * fmag;
+          }
+        }
+        k = k + 1u;
+      }
+    }
+
+    workgroupBarrier();
+    base = base + TILE_SIZE;
+  }
+
+  if (active) {
+    // Spin force in XZ plane with clamp
+    let posXZ = pos.xz;
+    let d = length(posXZ);
+    if (d > 0.0) {
+      let tangent = vec2<f32>(-posXZ.y, posXZ.x);
+      let spinForce = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin / d);
+      let lo = vec3<f32>(-1000.0);
+      let hi = vec3<f32>( 1000.0);
+      force = force + clamp(spinForce, lo, hi);
+    }
+
+    var v = (vel + force * params.dt) * params.damping;
+    var p = pos + v * params.dt;
+
+    posOut[i] = vec4<f32>(p, radiate_mag);
+    velOut[i] = vec4<f32>(v, 0.0);
+  }
+}
+`;
+
+        const renderWGSL = /* wgsl */`
+struct Matrices {
+  projection: mat4x4<f32>;
+  view: mat4x4<f32>;
+  viewportSize: vec2<f32>;
+  sizeScale: f32;
+  _pad: f32;
+};
+
+@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
+@group(0) @binding(1) var<uniform> mats: Matrices;
+
+struct VSOut {
+  @builtin(position) position: vec4<f32>;
+  @location(0) radiate: f32;
+  @location(1) corner: vec2<f32>;
+};
+
+@vertex
+fn vs_main(@location(0) corner: vec2<f32>, @builtin(instance_index) instance: u32) -> VSOut {
+  let pos4 = positions[instance];
+  let world = vec4<f32>(pos4.xyz, 1.0);
+  let viewPos = mats.view * world;
+  let clipCenter = mats.projection * viewPos;
+
+  // screen-space billboard using NDC offset scaled by clip.w
+  let sizePx = max(2.0, mats.sizeScale / max(1.0, -viewPos.z));
+  let offsetNDC = (corner * sizePx) * vec2<f32>(2.0 / mats.viewportSize.x, 2.0 / mats.viewportSize.y);
+
+  var out: VSOut;
+  out.position = clipCenter;
+  out.position.xy = out.position.xy + offsetNDC * clipCenter.w;
+  out.radiate = pos4.w;
+  out.corner = corner;
+  return out;
+}
+
+@fragment
+fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @location(0) vec4<f32> {
+  let rad = clamp(10.0 * radiate, 0.0, 1.0);
+  let r = length(corner);
+  if (r > 1.0) { discard; }
+  let alpha = smoothstep(0.7, 0.0, r);
+  return vec4<f32>(rad, 0.5, 1.0 - rad, alpha);
+}
+`;
+
+        // ---- Pipelines ----
+        const computeModule = device.createShaderModule({ code: computeWGSL });
+        const computePipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: computeModule, entryPoint: 'main' }
         });
 
-        const dampingSlider = document.getElementById('dampingSlider');
-        const dampingValueDisplay = document.getElementById('dampingValue');
-        dampingSlider.addEventListener('input', function (e) {
-            damping = parseFloat(e.target.value);
-            dampingValueDisplay.textContent = damping.toFixed(2);
+        const renderModule = device.createShaderModule({ code: renderWGSL });
+        // Quad geometry for billboard (two triangles)
+        const quadVerts = new Float32Array([
+            -1, -1,
+             1, -1,
+            -1,  1,
+             1,  1,
+        ]);
+        const quadIdx = new Uint16Array([0,1,2, 2,1,3]);
+        const quadVB = device.createBuffer({ size: quadVerts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(quadVB, 0, quadVerts.buffer, quadVerts.byteOffset, quadVerts.byteLength);
+        const quadIB = device.createBuffer({ size: quadIdx.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(quadIB, 0, quadIdx.buffer, quadIdx.byteOffset, quadIdx.byteLength);
+
+        const renderPipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: renderModule,
+                entryPoint: 'vs_main',
+                buffers: [{ arrayStride: 2 * 4, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }] }]
+            },
+            fragment: {
+                module: renderModule,
+                entryPoint: 'fs_main',
+                targets: [{
+                    format,
+                    blend: {
+                        color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }
+                    }
+                }]
+            },
+            primitive: { topology: 'triangle-list', cullMode: 'none' }
         });
 
-        const spinSlider = document.getElementById('spinSlider');
-        const spinValueDisplay = document.getElementById('spinValue');
-        spinSlider.addEventListener('input', function (e) {
-            spin = parseFloat(e.target.value);
-            spinValueDisplay.textContent = spin.toFixed(2);
-        });
-
-    // ---- Ping-Pong Swap Helpers ----
-    function swapTextures() {
-            [posTexA, posTexB, velTexA, velTexB] = [posTexB, posTexA, velTexB, velTexA];
+        // ---- Bind Groups ----
+        function createComputeBindGroup(posInBuf, velInBuf, posOutBuf, velOutBuf) {
+            return device.createBindGroup({
+                layout: computePipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: posInBuf } },
+                    { binding: 1, resource: { buffer: velInBuf } },
+                    { binding: 2, resource: { buffer: posOutBuf } },
+                    { binding: 3, resource: { buffer: velOutBuf } },
+                    { binding: 4, resource: { buffer: simParamsBuffer } },
+                ]
+            });
         }
+        let computeBG_AtoB = createComputeBindGroup(posA, velA, posB, velB);
+        let computeBG_BtoA = createComputeBindGroup(posB, velB, posA, velA);
 
-        // ---- Simulation Update Function (using FBO and MRT) ----
-        function updateSimulation() {
-            gl.useProgram(simProgram);
-            gl.bindFramebuffer(gl.FRAMEBUFFER, simFBO);
-
-            // Disable blending for the simulation update pass.
-            gl.disable(gl.BLEND);
-
-            // Attach the “next” textures as render targets.
-            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, posTexB, 0);
-            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, velTexB, 0);
-            gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
-
-            // Set uniforms.
-            gl.uniform1i(simUniforms.u_numParticles, NUM_PARTICLES);
-            gl.uniform1f(simUniforms.u_dt, DT);
-            gl.uniform1f(simUniforms.u_G, G);
-            gl.uniform1f(simUniforms.u_R, R);
-            gl.uniform1f(simUniforms.u_spin, spin);
-            gl.uniform1f(simUniforms.u_eps, EPS);
-            gl.uniform1f(simUniforms.u_damping, damping);
-            gl.uniform1f(simUniforms.u_texWidth, texWidth);
-            gl.uniform1f(simUniforms.u_texHeight, texHeight);
-
-            // Bind current state textures.
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, posTexA);
-            gl.uniform1i(simUniforms.u_positionTex, 0);
-            gl.activeTexture(gl.TEXTURE1);
-            gl.bindTexture(gl.TEXTURE_2D, velTexA);
-            gl.uniform1i(simUniforms.u_velocityTex, 1);
-
-            gl.bindVertexArray(quadVAO);
-            gl.viewport(0, 0, texWidth, texHeight);
-            gl.drawArrays(gl.TRIANGLES, 0, 6);
-            gl.bindVertexArray(null);
-            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-
-            // Swap ping-pong textures.
-            swapTextures();
-            // Reset viewport for rendering.
-            gl.viewport(0, 0, canvas.width, canvas.height);
+        function createRenderBindGroup(posBuf) {
+            return device.createBindGroup({
+                layout: renderPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: posBuf } },
+                    { binding: 1, resource: { buffer: matricesBuffer } },
+                ]
+            });
         }
+        let renderBG_posA = createRenderBindGroup(posA);
+        let renderBG_posB = createRenderBindGroup(posB);
 
-        // ---- Render Function (draw particles from posTexA) ----
-        function render() {
+        // ---- Main Loop ----
+        let readFromA = true; // indicates which buffers hold the latest state
 
-            // Enable blending for the render pass.
-            gl.enable(gl.BLEND);
-
-            gl.clearColor(0, 0, 0, 1);
-            gl.clear(gl.COLOR_BUFFER_BIT);
-            gl.useProgram(renderProgram);
-            gl.bindVertexArray(renderVAO);
-            gl.activeTexture(gl.TEXTURE0);
-            gl.bindTexture(gl.TEXTURE_2D, posTexA);
-            const locPosTex = gl.getUniformLocation(renderProgram, "u_positionTex");
-            gl.uniform1i(locPosTex, 0);
-            gl.uniform1f(gl.getUniformLocation(renderProgram, "u_texWidth"), texWidth);
-            gl.uniform1f(gl.getUniformLocation(renderProgram, "u_texHeight"), texHeight);
-            gl.uniformMatrix4fv(gl.getUniformLocation(renderProgram, "u_projection"), false, projMat);
-            gl.uniformMatrix4fv(gl.getUniformLocation(renderProgram, "u_view"), false, viewMat);
-
-            // Draw one point per texel (only NUM_PARTICLES are valid)
-            gl.drawArrays(gl.POINTS, 0, texWidth * texHeight);
-            gl.bindVertexArray(null);
-
-            /////////////// Debug visualization ///////////////
-            const debugDiv = document.getElementById('debug');
-
+        function updateDebug() {
             const currentTime = performance.now();
             const elapsedSeconds = (currentTime - startTime) / 1000;
             const fps = loopCount / elapsedSeconds;
-
-            let debugText = '<strong>Simulation Stats:</strong><br>';
-            debugText += `Frame: ${loopCount}<br>`;
-            debugText += `Runtime: ${elapsedSeconds.toFixed(1)}s<br>`;
-            debugText += `FPS: ${fps.toFixed(1)}<br>`;
-
+            let debugText = '<strong>Simulation Stats:</strong><br>' +
+                            `Frame: ${loopCount}<br>` +
+                            `Runtime: ${elapsedSeconds.toFixed(1)}s<br>` +
+                            `FPS: ${fps.toFixed(1)}<br>`;
             debugDiv.innerHTML = debugText;
         }
 
-        // ---- Animation Loop ----
-        function loop() {
-            if (loopCount == 10)
-                damping = 1.0;
-            if (loopCount == 150)
-                spin = 0.0;
-            updateSimulation();
-            render();
+        function frame() {
+            // Match nbody2.html timing tweaks
+            if (loopCount === 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
+            if (loopCount === 150) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
+
+            // Update matrices if size changed
+            projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
+            writeMatrices();
+
+            const encoder = device.createCommandEncoder();
+
+            // Compute pass
+            const cpass = encoder.beginComputePass();
+            cpass.setPipeline(computePipeline);
+            cpass.setBindGroup(0, readFromA ? computeBG_AtoB : computeBG_BtoA);
+            const workgroupSize = 256;
+            const workgroupCount = Math.ceil(particleCount / workgroupSize);
+            cpass.dispatchWorkgroups(workgroupCount);
+            cpass.end();
+
+            // Render pass
+            const colorView = context.getCurrentTexture().createView();
+            const rpass = encoder.beginRenderPass({
+                colorAttachments: [{ view: colorView, clearValue: { r:0, g:0, b:0, a:1 }, loadOp: 'clear', storeOp: 'store' }]
+            });
+            rpass.setPipeline(renderPipeline);
+            rpass.setVertexBuffer(0, quadVB);
+            rpass.setIndexBuffer(quadIB, 'uint16');
+            rpass.setBindGroup(0, readFromA ? renderBG_posB : renderBG_posA); // after compute, latest is the write buffer
+            rpass.drawIndexed(6, particleCount, 0, 0, 0);
+            rpass.end();
+
+            device.queue.submit([encoder.finish()]);
+
+            // Swap for next frame: the buffer we just wrote becomes the new read source
+            readFromA = !readFromA;
+
             loopCount++;
-            requestAnimationFrame(loop);
+            updateDebug();
+            requestAnimationFrame(frame);
         }
-        loop();
+        frame();
+    })();
     </script>
 </body>
 
