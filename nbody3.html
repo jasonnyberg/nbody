@@ -80,6 +80,9 @@
         let radiateCoeff = 0.01; // radiative damping coefficient
         let loopCount = 0;
         const startTime = performance.now();
+        // Fusion parameters
+        const FUSE_RADIUS = 3.0; // distance threshold for fusion (simulation units)
+        const FUSE_MIN_REL_SPEED = 0.5; // minimum relative speed to be considered a "smash"
 
         // UI wiring
         const gSlider = document.getElementById('gSlider');
@@ -158,14 +161,49 @@
         let velA = createBufferFromArray(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
         let velB = createEmptyBuffer(stateByteSize, GPUBufferUsage.STORAGE);
 
+        // ---- Mass Buffer ----
+        // Use simple atomic mass numbers (mass number A) to represent per-particle mass.
+        // Bias the distribution toward light elements (H/He), with a long, sparse tail to heavy elements up to Iron.
+        const MAX_ATOMIC_MASS = 56; // Iron-56 upper bound for initial masses
+        function randomAtomicMass() {
+            const u = Math.random();
+            if (u < 0.74) return 1;      // ~Hydrogen-1 dominant
+            if (u < 0.97) return 4;      // ~Helium-4 abundant
+            // Heavier nuclei: skew strongly toward lighter heavy elements
+            const v = Math.random();
+            // Power-law bias: v^4 concentrates near 0, few near 1 -> few very heavy nuclei (<= Fe)
+            const a = 3 + Math.floor(Math.pow(v, 4.0) * (MAX_ATOMIC_MASS - 3 + 1));
+            return Math.min(MAX_ATOMIC_MASS, Math.max(3, a));
+        }
+        const massesInit = new Float32Array(particleCount);
+        let maxMass = 0;
+        let massSum = 0;
+        for (let i = 0; i < particleCount; i++) {
+            const m = randomAtomicMass();
+            massesInit[i] = m;
+            massSum += m;
+            if (m > maxMass) maxMass = m;
+        }
+        const avgMass = massSum / particleCount;
+        // Physics mass scale keeps forces in a reasonable range when mass range is large
+        const massScale = Math.max(1, avgMass);
+        const massBuffer = createBufferFromArray(massesInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        // Fusion claims buffer (atomic flags) and params
+        const claimsBuffer = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const zeroClaims = new Uint32Array(particleCount); // reused each frame to clear claims
+        const fusionParamsData = new Float32Array([FUSE_RADIUS, FUSE_MIN_REL_SPEED, 0, 0]);
+        const fusionParamsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(fusionParamsBuffer, 0, fusionParamsData.buffer, fusionParamsData.byteOffset, fusionParamsData.byteLength);
+
         // ---- Uniform Buffers ----
         // Sim params: [dt, G, R, spin, eps, damping, numParticlesF, radiateCoeff]
         const simParamsData = new Float32Array([DT, G, R, spin, EPS, damping, particleCount, radiateCoeff]);
         const simParamsBuffer = device.createBuffer({ size: simParamsData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         function writeSimParams() {
+            // Do not scale G by massScale; keep R scaled to balance repulsion if desired
             simParamsData[0] = DT;
-            simParamsData[1] = G;
-            simParamsData[2] = R;
+            simParamsData[1] = G;           // G unscaled
+            simParamsData[2] = R / massScale; // R scaled (unchanged)
             simParamsData[3] = spin;
             simParamsData[4] = EPS;
             simParamsData[5] = damping;
@@ -183,7 +221,9 @@
             matricesData[32] = canvas.width;
             matricesData[33] = canvas.height;
             matricesData[34] = 5000.0; // size scale (matches WebGL version)
-            matricesData[35] = 0.0;     // pad
+            // Use log mapping for mass normalization to improve dynamic range in color/size
+            const invLogMax = maxMass > 0 ? (1.0 / Math.log(1.0 + maxMass)) : 1.0;
+            matricesData[35] = invLogMax; // packed parameter for render normalization
             device.queue.writeBuffer(matricesBuffer, 0, matricesData.buffer, matricesData.byteOffset, matricesData.byteLength);
         }
         const matricesBuffer = device.createBuffer({ size: matricesData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -194,6 +234,9 @@
         const numComPartials = Math.ceil(particleCount / COM_WG);
         const comPartialsBuffer = device.createBuffer({ size: numComPartials * 16, usage: GPUBufferUsage.STORAGE });
         const comBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
+        const smoothComBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        // Initialize smoothed COM to origin
+        device.queue.writeBuffer(smoothComBuffer, 0, new Float32Array([0, 0, 0, 1]));
 
         const comReduce1WGSL = /* wgsl */`
 struct SimParams {
@@ -201,19 +244,25 @@ struct SimParams {
   eps: f32, damping: f32, numParticlesF: f32, radiateCoeff: f32,
 }
 struct Vec4Buffer { data: array<vec4<f32>>, }
+struct FloatBuffer { data: array<f32>, }
 struct Partials { data: array<vec4<f32>>, }
 @group(0) @binding(0) var<storage, read> positions: Vec4Buffer;
 @group(0) @binding(1) var<storage, read_write> partials: Partials;
 @group(0) @binding(2) var<uniform> params: SimParams;
+@group(0) @binding(3) var<storage, read> masses: FloatBuffer;
 const WG: u32 = 256u;
-var<workgroup> s: array<vec3<f32>, WG>;
+var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*pos), w = sum(m)
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let i = wid.x * WG + lid.x;
-  var v = vec3<f32>(0.0);
   let n = u32(params.numParticlesF);
-  if (i < n) { v = positions.data[i].xyz; }
-  s[lid.x] = v;
+  var accum = vec4<f32>(0.0);
+  if (i < n) {
+    let p = positions.data[i].xyz;
+    let m = masses.data[i];
+    accum = vec4<f32>(p * m, m);
+  }
+  s[lid.x] = accum;
   workgroupBarrier();
   var stride: u32 = WG / 2u;
   loop {
@@ -222,7 +271,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     workgroupBarrier();
     stride = stride / 2u;
   }
-  if (lid.x == 0u) { partials.data[wid.x] = vec4<f32>(s[0u], 0.0); }
+  if (lid.x == 0u) { partials.data[wid.x] = s[0u]; }
 }
 `;
         const comReduce2WGSL = /* wgsl */`
@@ -236,16 +285,16 @@ struct Single { data: vec4<f32>, }
 @group(0) @binding(1) var<storage, read_write> comOut: Single;
 @group(0) @binding(2) var<uniform> params: SimParams;
 const WG: u32 = 256u;
-var<workgroup> s: array<vec3<f32>, WG>;
+var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*pos), w = sum(m)
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   let n = u32(params.numParticlesF);
   let numPartials = (n + WG - 1u) / WG;
-  var sum = vec3<f32>(0.0);
+  var sum = vec4<f32>(0.0);
   var j = lid.x;
   loop {
     if (j >= numPartials) { break; }
-    sum = sum + partials.data[j].xyz;
+    sum = sum + partials.data[j];
     j = j + WG;
   }
   s[lid.x] = sum;
@@ -258,8 +307,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     stride = stride / 2u;
   }
   if (lid.x == 0u) {
-    let invN = 1.0 / f32(n);
-    comOut.data = vec4<f32>(s[0u] * invN, 1.0);
+    let invM = select(0.0, 1.0 / s[0u].w, s[0u].w > 0.0);
+    let com = s[0u].xyz * invM;
+    // Store total mass in w for downstream camera tracker
+    comOut.data = vec4<f32>(com, s[0u].w);
   }
 }
 `;
@@ -268,24 +319,106 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         const comReduce2Module = device.createShaderModule({ code: comReduce2WGSL });
         const comReduce2Pipeline = device.createComputePipeline({ layout: 'auto', compute: { module: comReduce2Module, entryPoint: 'main' } });
 
-        function createComReduce1BindGroup(posBuf) {
-            return device.createBindGroup({
-                layout: comReduce1Pipeline.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: posBuf } },
-                    { binding: 1, resource: { buffer: comPartialsBuffer } },
-                    { binding: 2, resource: { buffer: simParamsBuffer } },
-                ]
-            });
-        }
-        const comReduce1BG_A = createComReduce1BindGroup(posA);
-        const comReduce1BG_B = createComReduce1BindGroup(posB);
+        // Bind groups for COM reduction (per position buffer)
+        const comReduce1BG_A = device.createBindGroup({
+            layout: comReduce1Pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posA } },
+                { binding: 1, resource: { buffer: comPartialsBuffer } },
+                { binding: 2, resource: { buffer: simParamsBuffer } },
+                { binding: 3, resource: { buffer: massBuffer } },
+            ],
+        });
+        const comReduce1BG_B = device.createBindGroup({
+            layout: comReduce1Pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posB } },
+                { binding: 1, resource: { buffer: comPartialsBuffer } },
+                { binding: 2, resource: { buffer: simParamsBuffer } },
+                { binding: 3, resource: { buffer: massBuffer } },
+            ],
+        });
+
         const comReduce2BG = device.createBindGroup({
             layout: comReduce2Pipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: comPartialsBuffer } },
                 { binding: 1, resource: { buffer: comBuffer } },
                 { binding: 2, resource: { buffer: simParamsBuffer } },
+            ]
+        });
+
+        // Smooth COM (exponential smoothing once per frame)
+        const comSmoothWGSL = /* wgsl */`
+struct Single { data: vec4<f32>, }
+@group(0) @binding(0) var<storage, read> comIn: Single;
+@group(0) @binding(1) var<storage, read_write> smoothOut: Single;
+@compute @workgroup_size(1)
+fn main() {
+  let c = comIn.data.xyz;
+  let s0 = smoothOut.data.xyz;
+  let alpha: f32 = 0.10; // smoothing factor per rendered frame
+  let s1 = s0 + (c - s0) * alpha; // linear interpolation
+  smoothOut.data = vec4<f32>(s1, 1.0);
+}
+`;
+        const comSmoothModule = device.createShaderModule({ code: comSmoothWGSL });
+        const comSmoothPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: comSmoothModule, entryPoint: 'main' } });
+        const comSmoothBG = device.createBindGroup({
+            layout: comSmoothPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: comBuffer } },
+                { binding: 1, resource: { buffer: smoothComBuffer } },
+            ]
+        });
+
+        // ---- Camera tracker (massless, gravitates toward COM) ----
+        // Buffers to hold tracker position (xyz, w=1) and velocity (xyz)
+        const camTrackPosBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const camTrackVelBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(camTrackPosBuffer, 0, new Float32Array([0, 0, 0, 1]));
+        device.queue.writeBuffer(camTrackVelBuffer, 0, new Float32Array([0, 0, 0, 0]));
+
+        const camTrackWGSL = /* wgsl */`
+struct SimParams {
+  dt: f32, G: f32, R: f32, spin: f32,
+  eps: f32, damping: f32, numParticlesF: f32, radiateCoeff: f32,
+}
+struct Single { data: vec4<f32>, }
+@group(0) @binding(0) var<storage, read> comIn: Single;          // xyz = COM, w = total mass
+@group(0) @binding(1) var<storage, read_write> camPos: Single;   // xyz = tracker position
+@group(0) @binding(2) var<storage, read_write> camVel: Single;   // xyz = tracker velocity
+@group(0) @binding(3) var<uniform> params: SimParams;
+
+@compute @workgroup_size(1)
+fn main() {
+  let c = comIn.data.xyz;
+  let M = comIn.data.w;
+  var p = camPos.data.xyz;
+  var v = camVel.data.xyz;
+  let diff = c - p;
+  let soft2 = dot(diff, diff) + params.eps * params.eps;
+  let invSoft = inverseSqrt(soft2);
+  let invSoft3 = invSoft * invSoft * invSoft; // 1/(r^3) with softening
+  let acc = params.G * M * diff * invSoft3;   // gravitational accel toward COM
+  let loA = vec3<f32>(-1000.0);
+  let hiA = vec3<f32>( 1000.0);
+  let a = clamp(acc, loA, hiA);
+  v = (v + a * params.dt) * params.damping;
+  p = p + v * params.dt;
+  camPos.data = vec4<f32>(p, 1.0);
+  camVel.data = vec4<f32>(v, 0.0);
+}
+`;
+        const camTrackModule = device.createShaderModule({ code: camTrackWGSL });
+        const camTrackPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: camTrackModule, entryPoint: 'main' } });
+        const camTrackBG = device.createBindGroup({
+            layout: camTrackPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: comBuffer } },
+                { binding: 1, resource: { buffer: camTrackPosBuffer } },
+                { binding: 2, resource: { buffer: camTrackVelBuffer } },
+                { binding: 3, resource: { buffer: simParamsBuffer } },
             ]
         });
 
@@ -304,6 +437,7 @@ struct SimParams {
 
 struct Vec4Buffer { data: array<vec4<f32>>, }
 struct Single { data: vec4<f32>, }
+struct FloatBuffer { data: array<f32>, }
 
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buffer;
 @group(0) @binding(1) var<storage, read> velIn: Vec4Buffer;
@@ -311,10 +445,12 @@ struct Single { data: vec4<f32>, }
 @group(0) @binding(3) var<storage, read_write> velOut: Vec4Buffer;
 @group(0) @binding(4) var<uniform> params: SimParams;
 @group(0) @binding(5) var<storage, read> comIn: Single;
+@group(0) @binding(6) var<storage, read> masses: FloatBuffer;
 
 const TILE_SIZE: u32 = 256u;
 var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
 var<workgroup> tileVel: array<vec4<f32>, TILE_SIZE>;
+var<workgroup> tileMass: array<f32, TILE_SIZE>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
@@ -332,10 +468,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 
   var pos: vec3<f32> = vec3<f32>(0.0);
   var vel: vec3<f32> = vec3<f32>(0.0);
+  var mi: f32 = 1.0;
   if (isActive) {
     pos = posIn.data[i].xyz;
     vel = velIn.data[i].xyz;
+    mi = masses.data[i];
   }
+  let activeParticle: bool = isActive && (mi > 0.0);
 
   var force: vec3<f32> = vec3<f32>(0.0);
   var radiate_mag: f32 = 0.0;
@@ -349,9 +488,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     if (jIndex < n) {
       tilePos[lid.x] = posIn.data[jIndex];
       tileVel[lid.x] = velIn.data[jIndex];
+      tileMass[lid.x] = masses.data[jIndex];
     } else {
       tilePos[lid.x] = vec4<f32>(0.0);
       tileVel[lid.x] = vec4<f32>(0.0);
+      tileMass[lid.x] = 0.0;
     }
     workgroupBarrier();
 
@@ -359,36 +500,41 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     var tileCount: u32 = TILE_SIZE;
     if (remaining < TILE_SIZE) { tileCount = remaining; }
 
-    if (isActive) {
+    if (activeParticle) {
       var k: u32 = 0u;
       loop {
         if (k >= tileCount) { break; }
         let jGlobal = base + k;
         if (jGlobal != i) {
-          let pj = tilePos[k].xyz;
-          let vj = tileVel[k].xyz;
-          let diff = pj - pos;
+          let mj = tileMass[k];
+          if (mj > 0.0) {
+            let pj = tilePos[k].xyz;
+            let vj = tileVel[k].xyz;
+            let diff = pj - pos;
 
-          // Plummer-type softening for both attraction and repulsion
-          let dist2 = dot(diff, diff);
-          let soft2 = dist2 + eps2;
-          let invSoft = inverseSqrt(soft2);
-          let dir = diff * invSoft;               // normalized direction
-          let invSoft2 = invSoft * invSoft;       // 1/soft^2
-          let invSoft6 = invSoft2 * invSoft2 * invSoft2; // 1/soft^6
+            // Plummer-type softening for both attraction and repulsion
+            let dist2 = dot(diff, diff);
+            let soft2 = dist2 + eps2;
+            let invSoft = inverseSqrt(soft2);
+            let dir = diff * invSoft;               // normalized direction
+            let invSoft2 = invSoft * invSoft;       // 1/soft^2
+            let invSoft6 = invSoft2 * invSoft2 * invSoft2; // 1/soft^6
 
-          let attractive = Gc * invSoft2;
-          let repulsive  = Rc * invSoft6;
+            // True force magnitudes: F = G * mi * mj / soft^2, similar scaling for repulsion
+            let attractiveF = Gc * mi * mj * invSoft2;
+            let repulsiveF  = Rc * mi * mj * invSoft6;
 
-          var radiate: f32 = 0.0;
-          if (repulsive > attractive) {
-            let closingSpeed = dot(diff, vel - vj);
-            radiate = Rcvt * closingSpeed * invSoft; // scaled by 1/soft
+            // Radiative damping modeled as acceleration; convert to force by multiplying with mi
+            var radiateAccel: f32 = 0.0;
+            if (repulsiveF > attractiveF) {
+              let closingSpeed = dot(diff, vel - vj);
+              radiateAccel = Rcvt * closingSpeed * invSoft; // acceleration units
+            }
+
+            let fmagF = attractiveF - repulsiveF - (radiateAccel * mi);
+            radiate_mag = radiate_mag + abs(radiateAccel); // store accel magnitude for visualization
+            force = force + dir * fmagF;
           }
-
-          let fmag = attractive - repulsive - radiate;
-          radiate_mag = radiate_mag + abs(radiate);
-          force = force + dir * fmag;
         }
         k = k + 1u;
       }
@@ -398,7 +544,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     base = base + TILE_SIZE;
   }
 
-  if (isActive) {
+  if (activeParticle) {
     // Spin force in XZ plane (skip completely if spin is zero)
     if (params.spin != 0.0) {
       let rel = pos - com;
@@ -407,22 +553,156 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
       if (d2 > 0.0) {
         let invd = inverseSqrt(d2);
         let tangent = vec2<f32>(-posXZ.y, posXZ.x);
-        let spinForce = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin * invd);
-        let lo = vec3<f32>(-1000.0);
-        let hi = vec3<f32>( 1000.0);
-        force = force + clamp(spinForce, lo, hi);
+        // Treat spin as an acceleration, independent of particle mass
+        let spinAccel = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin * invd);
+        let loA = vec3<f32>(-1000.0);
+        let hiA = vec3<f32>( 1000.0);
+        // Convert to force contribution by multiplying with mi so that after division by mi it yields mass-independent acceleration
+        force = force + clamp(spinAccel, loA, hiA) * mi;
       }
     }
 
-    var v = (vel + force * params.dt) * params.damping;
+    // Convert accumulated mass-weighted force to acceleration by dividing with mi
+    var v = (vel + (force / max(mi, 1e-6)) * params.dt) * params.damping;
     var p = pos + v * params.dt;
 
     posOut.data[i] = vec4<f32>(p, radiate_mag);
     velOut.data[i] = vec4<f32>(v, 0.0);
+  } else if (isActive) {
+    // Zero-mass particle: copy through to preserve radiate accumulator
+    posOut.data[i] = posIn.data[i];
+    velOut.data[i] = velIn.data[i];
   }
 }
 `;
 
+        // Fusion compute (runs after integration) — merges close, high-speed pairs; zero-mass excluded
+        const fusionWGSL = /* wgsl */`
+struct SimParams {
+  dt: f32, G: f32, R: f32, spin: f32,
+  eps: f32, damping: f32, numParticlesF: f32, radiateCoeff: f32,
+}
+struct FusionParams { fuseRadius: f32, minRelSpeed: f32, }
+struct Vec4Buffer { data: array<vec4<f32>>, }
+struct FloatBuffer { data: array<f32>, }
+struct Claims { data: array<atomic<u32>>, }
+
+@group(0) @binding(0) var<storage, read_write> positions: Vec4Buffer;
+@group(0) @binding(1) var<storage, read_write> velocities: Vec4Buffer;
+@group(0) @binding(2) var<storage, read_write> masses: FloatBuffer;
+@group(0) @binding(3) var<uniform> params: SimParams;
+@group(0) @binding(4) var<uniform> fparams: FusionParams;
+@group(0) @binding(5) var<storage, read_write> claims: Claims;
+
+const TILE_SIZE: u32 = 256u;
+var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
+var<workgroup> tileVel: array<vec4<f32>, TILE_SIZE>;
+var<workgroup> tileMass: array<f32, TILE_SIZE>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+  let i: u32 = gid.x;
+  let n: u32 = u32(params.numParticlesF);
+  let inBounds: bool = i < n;
+
+  var mi0: f32 = 0.0;
+  var canFuse: bool = false;
+  var p_i: vec3<f32> = vec3<f32>(0.0);
+  var v_i: vec3<f32> = vec3<f32>(0.0);
+  if (inBounds) {
+    mi0 = masses.data[i];
+    p_i = positions.data[i].xyz;
+    v_i = velocities.data[i].xyz;
+    if (mi0 > 0.0 && atomicLoad(&claims.data[i]) == 0u) {
+      canFuse = true;
+    }
+  }
+
+  let fuseR2 = fparams.fuseRadius * fparams.fuseRadius;
+  var bestJ: u32 = i;
+  var bestD2: f32 = fuseR2;
+
+  var base: u32 = 0u;
+  loop {
+    if (base >= n) { break; }
+    let jIndex = base + lid.x;
+    if (jIndex < n) {
+      tilePos[lid.x] = positions.data[jIndex];
+      tileVel[lid.x] = velocities.data[jIndex];
+      tileMass[lid.x] = masses.data[jIndex];
+    } else {
+      tilePos[lid.x] = vec4<f32>(0.0);
+      tileVel[lid.x] = vec4<f32>(0.0);
+      tileMass[lid.x] = 0.0;
+    }
+    workgroupBarrier();
+
+    let remaining: u32 = n - base;
+    var tileCount: u32 = TILE_SIZE;
+    if (remaining < TILE_SIZE) { tileCount = remaining; }
+
+    var k: u32 = 0u;
+    loop {
+      if (k >= tileCount) { break; }
+      let j: u32 = base + k;
+      if (canFuse && j != i) {
+        let mj = tileMass[k];
+        if (mj > 0.0) {
+          let dp = tilePos[k].xyz - p_i;
+          let d2 = dot(dp, dp);
+          if (d2 < bestD2) {
+            let rel = v_i - tileVel[k].xyz;
+            let relSpeed = length(rel);
+            if (relSpeed >= fparams.minRelSpeed) {
+              bestD2 = d2;
+              bestJ = j;
+            }
+          }
+        }
+      }
+      k = k + 1u;
+    }
+
+    workgroupBarrier();
+    base = base + TILE_SIZE;
+  }
+
+  if (canFuse && bestJ != i) {
+    // Only lower index survives; avoid mutual merges and races
+    if (i < bestJ) {
+      let selfLock = atomicCompareExchangeWeak(&claims.data[i], 0u, 2u);
+      if (selfLock.exchanged) {
+        let jLock = atomicCompareExchangeWeak(&claims.data[bestJ], 0u, 1u);
+        if (jLock.exchanged) {
+          // Re-read current values and merge conserving momentum and COM
+          let mi = masses.data[i];
+          let mj = masses.data[bestJ];
+          if (mi > 0.0 && mj > 0.0) {
+            let pi = positions.data[i].xyz;
+            let pj = positions.data[bestJ].xyz;
+            let vi = velocities.data[i].xyz;
+            let vj = velocities.data[bestJ].xyz;
+            let mNew = mi + mj;
+            if (mNew > 0.0) {
+              let pNew = (pi * mi + pj * mj) / mNew;
+              let vNew = (vi * mi + vj * mj) / mNew;
+              positions.data[i] = vec4<f32>(pNew, positions.data[i].w);
+              velocities.data[i] = vec4<f32>(vNew, 0.0);
+              masses.data[i] = mNew;
+
+              masses.data[bestJ] = 0.0;
+              velocities.data[bestJ] = vec4<f32>(0.0);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+        // Add render shader definition before pipelines
         const renderWGSL = /* wgsl */`
 struct Matrices {
   projection: mat4x4<f32>,
@@ -434,27 +714,34 @@ struct Matrices {
 
 struct Vec4Buffer { data: array<vec4<f32>>, }
 struct Single { data: vec4<f32>, }
+struct FloatBuffer { data: array<f32>, }
 
 @group(0) @binding(0) var<storage, read> positions: Vec4Buffer;
 @group(0) @binding(1) var<uniform> mats: Matrices;
 @group(0) @binding(2) var<storage, read> comIn: Single;
+@group(0) @binding(3) var<storage, read> masses: FloatBuffer;
 
 struct VSOut {
   @builtin(position) position: vec4<f32>,
   @location(0) radiate: f32,
   @location(1) corner: vec2<f32>,
+  @location(2) massNorm: f32,
 }
 
 @vertex
 fn vs_main(@location(0) corner: vec2<f32>, @builtin(instance_index) instance: u32) -> VSOut {
   let pos4 = positions.data[instance];
   let c = comIn.data.xyz;
+  let m = masses.data[instance];
+  // Logarithmic normalization for better spread across mass range
+  let invLogMax = mats._pad; // stores 1 / log(1 + maxMass)
+  let mNorm = clamp(log(1.0 + m) * invLogMax, 0.0, 1.0);
   let world = vec4<f32>(pos4.xyz - c, 1.0);
   let viewPos = mats.view * world;
   let clipCenter = mats.projection * viewPos;
 
-  // screen-space billboard using NDC offset scaled by clip.w
-  let sizePx = max(2.0, mats.sizeScale / max(1.0, -viewPos.z));
+  // size scaled by log-normalized mass
+  let sizePx = max(2.0, (mNorm + 0.2) * mats.sizeScale / max(1.0, -viewPos.z));
   let offsetNDC = (corner * sizePx) * vec2<f32>(2.0 / mats.viewportSize.x, 2.0 / mats.viewportSize.y);
   let offset = offsetNDC * clipCenter.w;
 
@@ -462,16 +749,22 @@ fn vs_main(@location(0) corner: vec2<f32>, @builtin(instance_index) instance: u3
   out.position = vec4<f32>(clipCenter.xy + offset, clipCenter.zw);
   out.radiate = pos4.w;
   out.corner = corner;
+  out.massNorm = mNorm;
   return out;
 }
 
 @fragment
-fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @location(0) vec4<f32> {
-  let rad = clamp(5.0 * radiate, 0.0, 1.0);
+fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>, @location(2) massNorm: f32) -> @location(0) vec4<f32> {
+  // Do not render zero-mass particles
+  if (massNorm == 0.0) { discard; }
   let r = length(corner);
   if (r > 1.0) { discard; }
   let alpha = smoothstep(0.7, 0.0, r);
-  return vec4<f32>(rad, 0.5, 1.0 - rad, alpha);
+  // green channel encodes mass, blue from (1 - mass), red from radiative magnitude
+  let g = massNorm;
+  let b = 1.0 - massNorm;
+  let rad = clamp(5.0 * radiate, 0.0, 1.0);
+  return vec4<f32>(rad, g, b, alpha);
 }
 `;
 
@@ -481,6 +774,10 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
             layout: 'auto',
             compute: { module: computeModule, entryPoint: 'main' }
         });
+
+        // Fusion pipeline
+        const fusionModule = device.createShaderModule({ code: fusionWGSL });
+        const fusionPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: fusionModule, entryPoint: 'main' } });
 
         const renderModule = device.createShaderModule({ code: renderWGSL });
         // Quad geometry for billboard (two triangles)
@@ -528,6 +825,7 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
                     { binding: 3, resource: { buffer: velOutBuf } },
                     { binding: 4, resource: { buffer: simParamsBuffer } },
                     { binding: 5, resource: { buffer: comBuffer } },
+                    { binding: 6, resource: { buffer: massBuffer } },
                 ]
             });
         }
@@ -540,12 +838,30 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
                 entries: [
                     { binding: 0, resource: { buffer: posBuf } },
                     { binding: 1, resource: { buffer: matricesBuffer } },
-                    { binding: 2, resource: { buffer: comBuffer } },
+                    // Center rendering on smoothed COM to avoid drift
+                    { binding: 2, resource: { buffer: smoothComBuffer } },
+                    { binding: 3, resource: { buffer: massBuffer } },
                 ]
             });
         }
         let renderBG_posA = createRenderBindGroup(posA);
         let renderBG_posB = createRenderBindGroup(posB);
+
+        function createFusionBindGroup(posBuf, velBuf) {
+            return device.createBindGroup({
+                layout: fusionPipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: posBuf } },
+                    { binding: 1, resource: { buffer: velBuf } },
+                    { binding: 2, resource: { buffer: massBuffer } },
+                    { binding: 3, resource: { buffer: simParamsBuffer } },
+                    { binding: 4, resource: { buffer: fusionParamsBuffer } },
+                    { binding: 5, resource: { buffer: claimsBuffer } },
+                ]
+            });
+        }
+        let fusionBG_posA = createFusionBindGroup(posA, velA);
+        let fusionBG_posB = createFusionBindGroup(posB, velB);
 
         // ---- Main Loop ----
         let readFromA = true; // indicates which buffers hold the latest state
@@ -557,7 +873,8 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
             let debugText = '<strong>Simulation Stats:</strong><br>' +
                             `Frame: ${loopCount}<br>` +
                             `Runtime: ${elapsedSeconds.toFixed(1)}s<br>` +
-                            `FPS: ${fps.toFixed(1)}<br>`;
+                            `FPS: ${fps.toFixed(1)}<br>` +
+                            `Avg Mass: ${avgMass.toFixed(1)}  Max Mass: ${maxMass.toFixed(0)}<br>`;
             debugDiv.innerHTML = debugText;
         }
 
@@ -591,9 +908,11 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
             // Per-substep params: dt and damping scaled
             const dtSub = DT / SUBSTEPS;
             const dampingSub = Math.pow(damping, 1.0 / SUBSTEPS);
+            const effectiveG = G;           // G unscaled per request
+            const effectiveR = R / massScale;
             simParamsData[0] = dtSub;      // dt
-            simParamsData[1] = G;          // G (unchanged)
-            simParamsData[2] = R;          // R (unchanged)
+            simParamsData[1] = effectiveG; // G
+            simParamsData[2] = effectiveR; // R scaled to match
             simParamsData[3] = spin;       // spin (unchanged)
             simParamsData[4] = EPS;        // eps (unchanged)
             simParamsData[5] = dampingSub; // per-substep damping
@@ -614,6 +933,16 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
                 localReadFromA = !localReadFromA;
             }
 
+            // Fusion: run after integration on the latest buffers
+            device.queue.writeBuffer(claimsBuffer, 0, zeroClaims); // clear claim flags
+            {
+              const fpass = encoder.beginComputePass();
+              fpass.setPipeline(fusionPipeline);
+              fpass.setBindGroup(0, localReadFromA ? fusionBG_posB : fusionBG_posA); // operate on latest write buffers
+              fpass.dispatchWorkgroups(workgroupCount);
+              fpass.end();
+            }
+
             // Recompute center of mass for rendering (using latest state)
             {
               const bg1 = localReadFromA ? comReduce1BG_B : comReduce1BG_A; // latest written buffer
@@ -628,6 +957,13 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
               p2.setBindGroup(0, comReduce2BG);
               p2.dispatchWorkgroups(1);
               p2.end();
+
+              // Smooth the COM once per frame for stable camera tracking
+              const ps = encoder.beginComputePass();
+              ps.setPipeline(comSmoothPipeline);
+              ps.setBindGroup(0, comSmoothBG);
+              ps.dispatchWorkgroups(1);
+              ps.end();
             }
 
             // Render pass after last substep
