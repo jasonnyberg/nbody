@@ -21,7 +21,7 @@
     <div id="debug"></div>
     <div style="position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
         <label for="gSlider">G: <span id="gValue">0.2</span></label><br>
-        <input type="range" id="gSlider" min="0.01" max="5.0" step="0.01" value="0.2">
+        <input type="range" id="gSlider" min="0.01" max="5.0" step="0.01" value="0.3">
     </div>
     <div style="position: fixed; top: 60px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
         <label for="dampingSlider">Damping: <span id="dampingValue">1.0</span></label><br>
@@ -32,12 +32,12 @@
         <input type="range" id="spinSlider" min="-1.0" max="1.0" step="0.01" value="0.0">
     </div>
     <div style="position: fixed; top: 160px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
-        <label for="radiateSlider">Radiative: <span id="radiateValue">0.01</span></label><br>
-        <input type="range" id="radiateSlider" min="0.0" max="0.1" step="0.001" value="0.01">
+        <label for="radiateSlider">Radiative: <span id="radiateValue">0.005</span></label><br>
+        <input type="range" id="radiateSlider" min="0.0" max="0.1" step="0.001" value="0.005">
     </div>
     <div style="position: fixed; top: 210px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
         <label for="fusionSlider">Fusion: <span id="fusionValue">1.00</span></label><br>
-        <input type="range" id="fusionSlider" min="0.10" max="5.00" step="0.01" value="1.00">
+        <input type="range" id="fusionSlider" min="0.10" max="5.00" step="0.01" value="1.20">
     </div>
 
     <script type="text/javascript">
@@ -72,7 +72,7 @@
         // ---- Simulation Parameters ----
         const NUM_PARTICLES = 256*100; // must be multiple of 100 per original
         const DT = 0.2;
-        let G = 0.2;
+        let G = 0.3;
         const R = 10000.0;
         let spin = 0.03;
         const EPS = 0.001;
@@ -81,13 +81,13 @@
         const radius = 1000.0;
         const cam_dist = 1000.0;
         const SUBSTEPS = 4; // physics substeps per rendered frame
-        let radiateCoeff = 0.01; // radiative damping coefficient
+        let radiateCoeff = 0.005; // radiative damping coefficient
         let loopCount = 0;
         const startTime = performance.now();
         // Fusion parameters
         const FUSE_RADIUS = 3.0; // distance threshold for fusion (simulation units)
         const FUSE_MIN_REL_SPEED = 0.5; // minimum relative speed to be considered a "smash"
-        let fusionFactor = 1.0; // user-controlled fusion ease factor (higher = easier to fuse)
+        let fusionFactor = 1.2; // user-controlled fusion ease factor (higher = easier to fuse)
 
         // UI wiring
         const gSlider = document.getElementById('gSlider');
@@ -105,6 +105,13 @@
         const fusionSlider = document.getElementById('fusionSlider');
         const fusionValueDisplay = document.getElementById('fusionValue');
         fusionSlider.addEventListener('input', (e) => { fusionFactor = parseFloat(e.target.value); fusionValueDisplay.textContent = fusionFactor.toFixed(2); writeFusionParams(); });
+
+        // Ensure initial values are reflected in UI at startup (uniforms are written later after buffers are created)
+        gSlider.value = G.toFixed(2);
+        gValueDisplay.textContent = G.toFixed(2);
+        fusionSlider.value = fusionFactor.toFixed(2);
+        fusionValueDisplay.textContent = fusionFactor.toFixed(2);
+        // Note: do not call writeSimParams()/writeFusionParams() here; buffers may not be created yet
 
         // ---- Helpers ----
         function perspectiveMatrix(fov, aspect, near, far) {
@@ -212,6 +219,19 @@
         // New: per-frame fuse flags for flash visualization
         const fuseFlagsBuffer = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         const zeroFuseFlags = new Float32Array(particleCount);
+        // New: dynamic mass stats (active count and max mass) computed on GPU each frame
+        const totalMass = massSum;
+        let dynActiveCount = particleCount;
+        let dynMaxMass = maxMass;
+        const statsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+        // Triple-buffer readback to avoid mapped-buffer hazards
+        const NUM_READBACK = 3;
+        const statsReadBuffers = Array.from({ length: NUM_READBACK }, () =>
+            device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+        );
+        const statsPendingMap = new Array(NUM_READBACK).fill(false);
+        let statsWriteIndex = 0;     // next preferred write target
+        let lastCopiedIndex = -1;    // index written last frame (to read this frame)
 
         // ---- Uniform Buffers ----
         // Sim params: [dt, G, R, spin, eps, damping, numParticlesF, radiateCoeff]
@@ -240,7 +260,7 @@
             matricesData[33] = canvas.height;
             matricesData[34] = 5000.0; // size scale (matches WebGL version)
             // Use log mapping for mass normalization to improve dynamic range in color/size
-            const invLogMax = maxMass > 0 ? (1.0 / Math.log(1.0 + maxMass)) : 1.0;
+            const invLogMax = dynMaxMass > 0 ? (1.0 / Math.log(1.0 + dynMaxMass)) : 1.0;
             matricesData[35] = invLogMax; // packed parameter for render normalization
             device.queue.writeBuffer(matricesBuffer, 0, matricesData.buffer, matricesData.byteOffset, matricesData.byteLength);
         }
@@ -317,7 +337,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   }
   s[lid.x] = sum;
   workgroupBarrier();
-  var stride: u32 = WG / 2u;
+  var stride: u32 = WG / 2;
   loop {
     if (stride == 0u) { break; }
     if (lid.x < stride) { s[lid.x] = s[lid.x] + s[lid.x + stride]; }
@@ -492,9 +512,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     vel = velIn.data[i].xyz;
     mi = masses.data[i];
   }
-  let activeParticle: bool = isActive && (mi > 0.0);
+  let hasMass: bool = isActive && (mi > 0.0);
 
   var force: vec3<f32> = vec3<f32>(0.0);
+  var acc: vec3<f32> = vec3<f32>(0.0);
   var radiate_mag: f32 = 0.0;
 
   var base: u32 = 0u;
@@ -518,7 +539,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     var tileCount: u32 = TILE_SIZE;
     if (remaining < TILE_SIZE) { tileCount = remaining; }
 
-    if (activeParticle) {
+    if (isActive) {
       var k: u32 = 0u;
       loop {
         if (k >= tileCount) { break; }
@@ -538,7 +559,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             let invSoft2 = invSoft * invSoft;       // 1/soft^2
             let invSoft6 = invSoft2 * invSoft2 * invSoft2; // 1/soft^6
 
-            // True force magnitudes: F = G * mi * mj / soft^2, similar scaling for repulsion
+            // Force/accel magnitudes
             let attractiveF = Gc * mi * mj * invSoft2;
             let repulsiveF  = Rc * mi * mj * invSoft6;
 
@@ -549,9 +570,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
               radiateAccel = Rcvt * closingSpeed * invSoft; // acceleration units
             }
 
-            let fmagF = attractiveF - repulsiveF - (radiateAccel * mi);
-            radiate_mag = radiate_mag + abs(radiateAccel); // store accel magnitude for visualization
-            force = force + dir * fmagF;
+            if (hasMass) {
+              let fmagF = attractiveF - repulsiveF - (radiateAccel * mi);
+              radiate_mag = radiate_mag + abs(radiateAccel);
+              force = force + dir * fmagF;
+            } else {
+              // massless test particle: accumulate acceleration directly (independent of mi)
+              let attractiveA = Gc * mj * invSoft2;
+              let repulsiveA  = Rc * mj * invSoft6;
+              let amag = attractiveA - repulsiveA - radiateAccel;
+              radiate_mag = radiate_mag + abs(radiateAccel);
+              acc = acc + dir * amag;
+            }
           }
         }
         k = k + 1u;
@@ -562,8 +592,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     base = base + TILE_SIZE;
   }
 
-  if (activeParticle) {
-    // Spin force in XZ plane (skip completely if spin is zero)
+  if (isActive) {
+    // Spin acceleration in XZ plane (independent of particle mass)
+    var spinAccel: vec3<f32> = vec3<f32>(0.0);
     if (params.spin != 0.0) {
       let rel = pos - com;
       let posXZ = rel.xz;
@@ -571,25 +602,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
       if (d2 > 0.0) {
         let invd = inverseSqrt(d2);
         let tangent = vec2<f32>(-posXZ.y, posXZ.x);
-        // Treat spin as an acceleration, independent of particle mass
-        let spinAccel = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin * invd);
+        spinAccel = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin * invd);
         let loA = vec3<f32>(-1000.0);
         let hiA = vec3<f32>( 1000.0);
-        // Convert to force contribution by multiplying with mi so that after division by mi it yields mass-independent acceleration
-        force = force + clamp(spinAccel, loA, hiA) * mi;
+        spinAccel = clamp(spinAccel, loA, hiA);
       }
     }
 
-    // Convert accumulated mass-weighted force to acceleration by dividing with mi
-    var v = (vel + (force / max(mi, 1e-6)) * params.dt) * params.damping;
-    var p = pos + v * params.dt;
-
-    posOut.data[i] = vec4<f32>(p, radiate_mag);
-    velOut.data[i] = vec4<f32>(v, 0.0);
-  } else if (isActive) {
-    // Zero-mass particle: copy through to preserve radiate accumulator
-    posOut.data[i] = posIn.data[i];
-    velOut.data[i] = velIn.data[i];
+    if (hasMass) {
+      // Convert accumulated mass-weighted force to acceleration by dividing with mi
+      var v = (vel + ((force / max(mi, 1e-6)) + spinAccel) * params.dt) * params.damping;
+      var p = pos + v * params.dt;
+      posOut.data[i] = vec4<f32>(p, radiate_mag);
+      velOut.data[i] = vec4<f32>(v, 0.0);
+    } else {
+      // Massless test particle integration using direct acceleration
+      var v = (vel + (acc + spinAccel) * params.dt) * params.damping;
+      var p = pos + v * params.dt;
+      posOut.data[i] = vec4<f32>(p, radiate_mag);
+      velOut.data[i] = vec4<f32>(v, 0.0);
+    }
   }
 }
 `;
@@ -857,56 +889,134 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>, @location(
             primitive: { topology: 'triangle-list', cullMode: 'none' }
         });
 
-        // ---- Bind Groups ----
-        function createComputeBindGroup(posInBuf, velInBuf, posOutBuf, velOutBuf) {
-            return device.createBindGroup({
-                layout: computePipeline.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: posInBuf } },
-                    { binding: 1, resource: { buffer: velInBuf } },
-                    { binding: 2, resource: { buffer: posOutBuf } },
-                    { binding: 3, resource: { buffer: velOutBuf } },
-                    { binding: 4, resource: { buffer: simParamsBuffer } },
-                    { binding: 5, resource: { buffer: comBuffer } },
-                    { binding: 6, resource: { buffer: massBuffer } },
-                ]
-            });
-        }
-        let computeBG_AtoB = createComputeBindGroup(posA, velA, posB, velB);
-        let computeBG_BtoA = createComputeBindGroup(posB, velB, posA, velA);
+        // New: Mass stats reduction (active count and max mass)
+        const massStatsWGSL = /* wgsl */`
+struct SimParams {
+  dt: f32, G: f32, R: f32, spin: f32,
+  eps: f32, damping: f32, numParticlesF: f32, radiateCoeff: f32,
+}
+struct FloatBuffer { data: array<f32>, }
+struct Stats { activeCount: atomic<u32>, maxMassBits: atomic<u32>, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> masses: FloatBuffer;
+@group(0) @binding(1) var<storage, read_write> stats: Stats;
+@group(0) @binding(2) var<uniform> params: SimParams;
+const WG: u32 = 256u;
+var<workgroup> sCount: array<u32, WG>;
+var<workgroup> sMax: array<f32, WG>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let i = wid.x * WG + lid.x;
+  let n = u32(params.numParticlesF);
+  var c: u32 = 0u;
+  var m: f32 = 0.0;
+  if (i < n) {
+    let mi = masses.data[i];
+    if (mi > 0.0) { c = 1u; m = mi; }
+  }
+  sCount[lid.x] = c;
+  sMax[lid.x] = m;
+  workgroupBarrier();
+  var stride: u32 = WG / 2u;
+  loop {
+    if (stride == 0u) { break; }
+    if (lid.x < stride) {
+      sCount[lid.x] = sCount[lid.x] + sCount[lid.x + stride];
+      sMax[lid.x] = max(sMax[lid.x], sMax[lid.x + stride]);
+    }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+  if (lid.x == 0u) {
+    atomicAdd(&stats.activeCount, sCount[0u]);
+    let bits = bitcast<u32>(sMax[0u]);
+    atomicMax(&stats.maxMassBits, bits);
+  }
+}
+`;
+        const massStatsModule = device.createShaderModule({ code: massStatsWGSL });
+        const massStatsPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: massStatsModule, entryPoint: 'main' } });
+        const massStatsBG = device.createBindGroup({
+            layout: massStatsPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: massBuffer } },
+                { binding: 1, resource: { buffer: statsBuffer } },
+                { binding: 2, resource: { buffer: simParamsBuffer } },
+            ]
+        });
 
-        function createRenderBindGroup(posBuf) {
-            return device.createBindGroup({
-                layout: renderPipeline.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: posBuf } },
-                    { binding: 1, resource: { buffer: matricesBuffer } },
-                    // Center rendering on smoothed COM to avoid drift
-                    { binding: 2, resource: { buffer: smoothComBuffer } },
-                    { binding: 3, resource: { buffer: massBuffer } },
-                    { binding: 4, resource: { buffer: fuseFlagsBuffer } },
-                ]
-            });
-        }
-        let renderBG_posA = createRenderBindGroup(posA);
-        let renderBG_posB = createRenderBindGroup(posB);
+        // Compute bind groups (ping-pong)
+        const computeBG_AtoB = device.createBindGroup({
+            layout: computePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posA } },
+                { binding: 1, resource: { buffer: velA } },
+                { binding: 2, resource: { buffer: posB } },
+                { binding: 3, resource: { buffer: velB } },
+                { binding: 4, resource: { buffer: simParamsBuffer } },
+                { binding: 5, resource: { buffer: comBuffer } },
+                { binding: 6, resource: { buffer: massBuffer } },
+            ]
+        });
+        const computeBG_BtoA = device.createBindGroup({
+            layout: computePipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posB } },
+                { binding: 1, resource: { buffer: velB } },
+                { binding: 2, resource: { buffer: posA } },
+                { binding: 3, resource: { buffer: velA } },
+                { binding: 4, resource: { buffer: simParamsBuffer } },
+                { binding: 5, resource: { buffer: comBuffer } },
+                { binding: 6, resource: { buffer: massBuffer } },
+            ]
+        });
 
-        function createFusionBindGroup(posBuf, velBuf) {
-            return device.createBindGroup({
-                layout: fusionPipeline.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: posBuf } },
-                    { binding: 1, resource: { buffer: velBuf } },
-                    { binding: 2, resource: { buffer: massBuffer } },
-                    { binding: 3, resource: { buffer: simParamsBuffer } },
-                    { binding: 4, resource: { buffer: fusionParamsBuffer } },
-                    { binding: 5, resource: { buffer: claimsBuffer } },
-                    { binding: 6, resource: { buffer: fuseFlagsBuffer } },
-                ]
-            });
-        }
-        let fusionBG_posA = createFusionBindGroup(posA, velA);
-        let fusionBG_posB = createFusionBindGroup(posB, velB);
+        // Fusion bind groups (operate on latest state buffers)
+        const fusionBG_posA = device.createBindGroup({
+            layout: fusionPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posA } },
+                { binding: 1, resource: { buffer: velA } },
+                { binding: 2, resource: { buffer: massBuffer } },
+                { binding: 3, resource: { buffer: simParamsBuffer } },
+                { binding: 4, resource: { buffer: fusionParamsBuffer } },
+                { binding: 5, resource: { buffer: claimsBuffer } },
+                { binding: 6, resource: { buffer: fuseFlagsBuffer } },
+            ]
+        });
+        const fusionBG_posB = device.createBindGroup({
+            layout: fusionPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posB } },
+                { binding: 1, resource: { buffer: velB } },
+                { binding: 2, resource: { buffer: massBuffer } },
+                { binding: 3, resource: { buffer: simParamsBuffer } },
+                { binding: 4, resource: { buffer: fusionParamsBuffer } },
+                { binding: 5, resource: { buffer: claimsBuffer } },
+                { binding: 6, resource: { buffer: fuseFlagsBuffer } },
+            ]
+        });
+
+        // Render bind groups
+        const renderBG_posA = device.createBindGroup({
+            layout: renderPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posA } },
+                { binding: 1, resource: { buffer: matricesBuffer } },
+                { binding: 2, resource: { buffer: smoothComBuffer } },
+                { binding: 3, resource: { buffer: massBuffer } },
+                { binding: 4, resource: { buffer: fuseFlagsBuffer } },
+            ]
+        });
+        const renderBG_posB = device.createBindGroup({
+            layout: renderPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: posB } },
+                { binding: 1, resource: { buffer: matricesBuffer } },
+                { binding: 2, resource: { buffer: smoothComBuffer } },
+                { binding: 3, resource: { buffer: massBuffer } },
+                { binding: 4, resource: { buffer: fuseFlagsBuffer } },
+            ]
+        });
 
         // ---- Main Loop ----
         let readFromA = true; // indicates which buffers hold the latest state
@@ -915,18 +1025,19 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>, @location(
             const currentTime = performance.now();
             const elapsedSeconds = (currentTime - startTime) / 1000;
             const fps = loopCount / elapsedSeconds;
+            const avgActiveMass = totalMass / Math.max(1, dynActiveCount);
             let debugText = '<strong>Simulation Stats:</strong><br>' +
                             `Frame: ${loopCount}<br>` +
                             `Runtime: ${elapsedSeconds.toFixed(1)}s<br>` +
                             `FPS: ${fps.toFixed(1)}<br>` +
-                            `Avg Mass: ${avgMass.toFixed(1)}  Max Mass: ${maxMass.toFixed(0)}<br>`;
+                            `Avg Mass: ${avgActiveMass.toFixed(1)}  Max Mass: ${dynMaxMass.toFixed(0)}<br>`;
             debugDiv.innerHTML = debugText;
         }
 
         function frame() {
             // Match nbody2.html timing tweaks
             if (loopCount === 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
-            if (loopCount === 150) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
+            if (loopCount === 256) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
 
             // Update matrices if size changed
             projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
@@ -984,14 +1095,36 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>, @location(
             {
               const fpass = encoder.beginComputePass();
               fpass.setPipeline(fusionPipeline);
-              fpass.setBindGroup(0, localReadFromA ? fusionBG_posB : fusionBG_posA); // operate on latest write buffers
+              fpass.setBindGroup(0, localReadFromA ? fusionBG_posA : fusionBG_posB); // operate on latest write buffers
               fpass.dispatchWorkgroups(workgroupCount);
               fpass.end();
             }
 
+            // Mass stats pass (after fusion) + copy to CPU readback
+            device.queue.writeBuffer(statsBuffer, 0, new Uint32Array(4)); // reset counters
+            let copiedThisFrameIndex = -1;
+            {
+              const spass = encoder.beginComputePass();
+              spass.setPipeline(massStatsPipeline);
+              spass.setBindGroup(0, massStatsBG);
+              spass.dispatchWorkgroups(workgroupCount);
+              spass.end();
+              // Choose a non-mapped buffer to write this frame; if none, skip copy
+              let writeIdx = -1;
+              for (let t = 0; t < NUM_READBACK; t++) {
+                const idx = (statsWriteIndex + t) % NUM_READBACK;
+                if (!statsPendingMap[idx]) { writeIdx = idx; break; }
+              }
+              if (writeIdx !== -1) {
+                encoder.copyBufferToBuffer(statsBuffer, 0, statsReadBuffers[writeIdx], 0, 16);
+                copiedThisFrameIndex = writeIdx;
+                statsWriteIndex = (writeIdx + 1) % NUM_READBACK;
+              }
+            }
+
             // Recompute center of mass for rendering (using latest state)
             {
-              const bg1 = localReadFromA ? comReduce1BG_B : comReduce1BG_A; // latest written buffer
+              const bg1 = localReadFromA ? comReduce1BG_A : comReduce1BG_B; // latest written buffer
               const p1 = encoder.beginComputePass();
               p1.setPipeline(comReduce1Pipeline);
               p1.setBindGroup(0, bg1);
@@ -1020,11 +1153,33 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>, @location(
             rpass.setPipeline(renderPipeline);
             rpass.setVertexBuffer(0, quadVB);
             rpass.setIndexBuffer(quadIB, 'uint16');
-            rpass.setBindGroup(0, localReadFromA ? renderBG_posB : renderBG_posA); // latest is the write buffer from final substep
+            rpass.setBindGroup(0, localReadFromA ? renderBG_posA : renderBG_posB); // latest is the write buffer from final substep
             rpass.drawIndexed(6, particleCount, 0, 0, 0);
             rpass.end();
 
             device.queue.submit([encoder.finish()]);
+
+            // Read last frame's results (buffer we wrote in the previous frame)
+            if (lastCopiedIndex !== -1 && !statsPendingMap[lastCopiedIndex]) {
+              const readIdx = lastCopiedIndex;
+              statsPendingMap[readIdx] = true;
+              statsReadBuffers[readIdx].mapAsync(GPUMapMode.READ).then(() => {
+                const u8 = new Uint8Array(statsReadBuffers[readIdx].getMappedRange());
+                const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+                const active = dv.getUint32(0, true);
+                const maxBits = dv.getUint32(4, true);
+                const maxMassF = new Float32Array(new Uint32Array([maxBits]).buffer)[0];
+                statsReadBuffers[readIdx].unmap();
+                statsPendingMap[readIdx] = false;
+                dynActiveCount = Math.max(1, active);
+                dynMaxMass = Math.max(1.0, maxMassF);
+                // Update matrices for next frame's normalization
+                writeMatrices();
+              }).catch(() => { statsPendingMap[readIdx] = false; /* ignore on navigation */ });
+            }
+
+            // Remember which buffer we wrote this frame so we can read it next frame (if we wrote any)
+            if (copiedThisFrameIndex !== -1) { lastCopiedIndex = copiedThisFrameIndex; }
 
             // Update global readFromA for next frame
             readFromA = localReadFromA;
