@@ -29,7 +29,7 @@
     </div>
     <div style="position: fixed; top: 110px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
         <label for="spinSlider">Spin: <span id="spinValue">0.0</span></label><br>
-        <input type="range" id="spinSlider" min="0.0" max="1.0" step="0.01" value="0.0">
+        <input type="range" id="spinSlider" min="-1.0" max="1.0" step="0.01" value="0.0">
     </div>
 
     <script type="text/javascript">
@@ -44,13 +44,15 @@
             return;
         }
 
-        const adapter = await navigator.gpu.requestAdapter();
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
+            || await navigator.gpu.requestAdapter();
         if (!adapter) { alert('Failed to get GPU adapter'); return; }
         const device = await adapter.requestDevice();
         const context = canvas.getContext('webgpu');
         const format = navigator.gpu.getPreferredCanvasFormat();
 
         function resizeCanvas() {
+            //const dpr = 1; // force DPR=1 for performance; set to window.devicePixelRatio for full res
             const dpr = Math.max(1, window.devicePixelRatio || 1);
             canvas.width = Math.floor(canvas.clientWidth * dpr);
             canvas.height = Math.floor(canvas.clientHeight * dpr);
@@ -180,38 +182,40 @@
         // ---- Shaders (WGSL) ----
         const computeWGSL = /* wgsl */`
 struct SimParams {
-  dt: f32;
-  G: f32;
-  R: f32;
-  spin: f32;
-  eps: f32;
-  damping: f32;
-  numParticlesF: f32;
-  _pad: f32;
-};
+  dt: f32,
+  G: f32,
+  R: f32,
+  spin: f32,
+  eps: f32,
+  damping: f32,
+  numParticlesF: f32,
+  _pad: f32,
+}
 
-@group(0) @binding(0) var<storage, read> posIn: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> velIn: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> posOut: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read_write> velOut: array<vec4<f32>>;
+struct Vec4Buffer { data: array<vec4<f32>>, }
+
+@group(0) @binding(0) var<storage, read> posIn: Vec4Buffer;
+@group(0) @binding(1) var<storage, read> velIn: Vec4Buffer;
+@group(0) @binding(2) var<storage, read_write> posOut: Vec4Buffer;
+@group(0) @binding(3) var<storage, read_write> velOut: Vec4Buffer;
 @group(0) @binding(4) var<uniform> params: SimParams;
 
-const TILE_SIZE: u32 = 256u;
+const TILE_SIZE: u32 = 128u;
 var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
 var<workgroup> tileVel: array<vec4<f32>, TILE_SIZE>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(local_invocation_id)  lid: vec3<u32>) {
   let i: u32 = gid.x;
   let n: u32 = u32(params.numParticlesF);
-  let active: bool = i < n;
+  let isActive: bool = i < n;
 
   var pos: vec3<f32> = vec3<f32>(0.0);
   var vel: vec3<f32> = vec3<f32>(0.0);
-  if (active) {
-    pos = posIn[i].xyz;
-    vel = velIn[i].xyz;
+  if (isActive) {
+    pos = posIn.data[i].xyz;
+    vel = velIn.data[i].xyz;
   }
 
   var force: vec3<f32> = vec3<f32>(0.0);
@@ -224,18 +228,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     // Load a tile of j-particles into shared memory
     let jIndex = base + lid.x;
     if (jIndex < n) {
-      tilePos[lid.x] = posIn[jIndex];
-      tileVel[lid.x] = velIn[jIndex];
+      tilePos[lid.x] = posIn.data[jIndex];
+      tileVel[lid.x] = velIn.data[jIndex];
     } else {
       tilePos[lid.x] = vec4<f32>(0.0);
       tileVel[lid.x] = vec4<f32>(0.0);
     }
     workgroupBarrier();
 
-    let remaining = n - base;
-    let tileCount: u32 = select(TILE_SIZE, remaining, remaining < TILE_SIZE);
+    let remaining: u32 = n - base;
+    var tileCount: u32 = TILE_SIZE;
+    if (remaining < TILE_SIZE) { tileCount = remaining; }
 
-    if (active) {
+    if (isActive) {
       var k: u32 = 0u;
       loop {
         if (k >= tileCount) { break; }
@@ -244,17 +249,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
           let pj = tilePos[k].xyz;
           let vj = tileVel[k].xyz;
           let diff = pj - pos;
-          let dist = length(diff);
-          if (dist >= params.eps) {
-            let dir = diff / dist;
-            let dist2 = dist * dist;
-            let dist6 = dist2 * dist2 * dist2;
-            let attractive = params.G / dist2;
-            let repulsive  = params.R / dist6;
+          let dist2 = dot(diff, diff);
+          let eps2 = params.eps * params.eps;
+          if (dist2 >= eps2) {
+            // Fast inverse sqrt path
+            let invDist = inverseSqrt(dist2);
+            let dir = diff * invDist;
+            let invDist2 = invDist * invDist;       // 1/dist^2
+            let invDist6 = invDist2 * invDist2 * invDist2; // 1/dist^6
+            let attractive = params.G * invDist2;
+            let repulsive  = params.R * invDist6;
             var radiate: f32 = 0.0;
             if (repulsive > attractive) {
               let closingSpeed = dot(diff, vel - vj);
-              radiate = 0.01 * closingSpeed / dist;
+              radiate = 0.01 * closingSpeed * invDist; // /dist
             }
             let fmag = attractive - repulsive - radiate;
             radiate_mag = radiate_mag + abs(radiate);
@@ -269,13 +277,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     base = base + TILE_SIZE;
   }
 
-  if (active) {
-    // Spin force in XZ plane with clamp
+  if (isActive) {
+    // Spin force in XZ plane with clamp (use inv sqrt)
     let posXZ = pos.xz;
-    let d = length(posXZ);
-    if (d > 0.0) {
+    let d2 = dot(posXZ, posXZ);
+    if (d2 > 0.0) {
+      let invd = inverseSqrt(d2);
       let tangent = vec2<f32>(-posXZ.y, posXZ.x);
-      let spinForce = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin / d);
+      let spinForce = vec3<f32>(tangent.x, 0.0, tangent.y) * (params.spin * invd);
       let lo = vec3<f32>(-1000.0);
       let hi = vec3<f32>( 1000.0);
       force = force + clamp(spinForce, lo, hi);
@@ -284,33 +293,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     var v = (vel + force * params.dt) * params.damping;
     var p = pos + v * params.dt;
 
-    posOut[i] = vec4<f32>(p, radiate_mag);
-    velOut[i] = vec4<f32>(v, 0.0);
+    posOut.data[i] = vec4<f32>(p, radiate_mag);
+    velOut.data[i] = vec4<f32>(v, 0.0);
   }
 }
 `;
 
         const renderWGSL = /* wgsl */`
 struct Matrices {
-  projection: mat4x4<f32>;
-  view: mat4x4<f32>;
-  viewportSize: vec2<f32>;
-  sizeScale: f32;
-  _pad: f32;
-};
+  projection: mat4x4<f32>,
+  view: mat4x4<f32>,
+  viewportSize: vec2<f32>,
+  sizeScale: f32,
+  _pad: f32,
+}
 
-@group(0) @binding(0) var<storage, read> positions: array<vec4<f32>>;
+struct Vec4Buffer { data: array<vec4<f32>>, }
+
+@group(0) @binding(0) var<storage, read> positions: Vec4Buffer;
 @group(0) @binding(1) var<uniform> mats: Matrices;
 
 struct VSOut {
-  @builtin(position) position: vec4<f32>;
-  @location(0) radiate: f32;
-  @location(1) corner: vec2<f32>;
-};
+  @builtin(position) position: vec4<f32>,
+  @location(0) radiate: f32,
+  @location(1) corner: vec2<f32>,
+}
 
 @vertex
 fn vs_main(@location(0) corner: vec2<f32>, @builtin(instance_index) instance: u32) -> VSOut {
-  let pos4 = positions[instance];
+  let pos4 = positions.data[instance];
   let world = vec4<f32>(pos4.xyz, 1.0);
   let viewPos = mats.view * world;
   let clipCenter = mats.projection * viewPos;
@@ -318,10 +329,10 @@ fn vs_main(@location(0) corner: vec2<f32>, @builtin(instance_index) instance: u3
   // screen-space billboard using NDC offset scaled by clip.w
   let sizePx = max(2.0, mats.sizeScale / max(1.0, -viewPos.z));
   let offsetNDC = (corner * sizePx) * vec2<f32>(2.0 / mats.viewportSize.x, 2.0 / mats.viewportSize.y);
+  let offset = offsetNDC * clipCenter.w;
 
   var out: VSOut;
-  out.position = clipCenter;
-  out.position.xy = out.position.xy + offsetNDC * clipCenter.w;
+  out.position = vec4<f32>(clipCenter.xy + offset, clipCenter.zw);
   out.radiate = pos4.w;
   out.corner = corner;
   return out;
@@ -436,7 +447,7 @@ fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>) -> @locati
             const cpass = encoder.beginComputePass();
             cpass.setPipeline(computePipeline);
             cpass.setBindGroup(0, readFromA ? computeBG_AtoB : computeBG_BtoA);
-            const workgroupSize = 256;
+            const workgroupSize = 128;
             const workgroupCount = Math.ceil(particleCount / workgroupSize);
             cpass.dispatchWorkgroups(workgroupCount);
             cpass.end();
