@@ -40,8 +40,8 @@
         <input type="range" id="fusionSlider" min="0.01" max="5.00" step="0.01" value="0.01">
     </div>
     <div style="position: fixed; top: 260px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
-        <label for="timestepSlider">Timestep: <span id="timestepValue">1.0</span></label><br>
-        <input type="range" id="timestepSlider" min="0.1" max="10.0" step="0.1" value="1.0">
+        <label for="timestepSlider">Timestep: <span id="timestepValue">0.2</span></label><br>
+        <input type="range" id="timestepSlider" min="0.01" max="1.0" step="0.01" value="0.2">
     </div>
     <!-- New: Substeps slider -->
     <div style="position: fixed; top: 310px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
@@ -89,7 +89,6 @@
 
         // ---- Simulation Parameters ----
         const NUM_PARTICLES = 512*100; // must be multiple of 100 per original
-        const DT = 1.0;
         let G = 0.3;
         const R = 10000.0;
         let spin = 0.03;
@@ -101,10 +100,8 @@
         // Changed: SUBSTEPS is now runtime-adjustable via UI
         let SUBSTEPS = 4; // physics substeps per rendered frame
         let radiateCoeff = 0.005; // radiative damping coefficient
-        let dtMultiplier = 1.0;   // timestep scale factor from slider (1..10)
-        // New: emission parameters
-        let fusionBoost = 2.0;    // boost factor applied to survivor's repulsion on fusion
-        let decayHalfLife = 1.0;  // half-life (simulation time units) for emission decay
+        // Replaced DT + dtMultiplier with a configurable base timestep
+        let baseDt = 0.2;   // timestep per frame before substepping; slider controls this directly
         let loopCount = 0;
         const startTime = performance.now();
         let lastFrameMs = 0;
@@ -112,6 +109,9 @@
         const FUSE_RADIUS = 3.0; // distance threshold for fusion (simulation units)
         const FUSE_MIN_REL_SPEED = 0.1; // minimum relative speed to be considered a "smash"
         let fusionFactor = 0.01; // user-controlled fusion ease factor (higher = easier to fuse)
+        // New: defaults for fusion energy emission/decay controls
+        let fusionBoost = 2.0;     // default boost factor applied on fusion
+        let decayHalfLife = 1.0;   // seconds; half-life for repulsion decay
 
         // UI wiring
         const gSlider = document.getElementById('gSlider');
@@ -131,7 +131,10 @@
         fusionSlider.addEventListener('input', (e) => { fusionFactor = parseFloat(e.target.value); fusionValueDisplay.textContent = fusionFactor.toFixed(2); writeFusionParams(); });
         const timestepSlider = document.getElementById('timestepSlider');
         const timestepValueDisplay = document.getElementById('timestepValue');
-        timestepSlider.addEventListener('input', (e) => { dtMultiplier = parseFloat(e.target.value); timestepValueDisplay.textContent = dtMultiplier.toFixed(1); });
+        timestepSlider.addEventListener('input', (e) => {
+            baseDt = parseFloat(e.target.value);
+            timestepValueDisplay.textContent = baseDt.toFixed(2);
+        });
         // New: substeps slider
         const substepsSlider = document.getElementById('substepsSlider');
         const substepsValueDisplay = document.getElementById('substepsValue');
@@ -160,8 +163,15 @@
         gValueDisplay.textContent = G.toFixed(2);
         fusionSlider.value = fusionFactor.toFixed(2);
         fusionValueDisplay.textContent = fusionFactor.toFixed(2);
-        timestepSlider.value = dtMultiplier.toFixed(0);
-        timestepValueDisplay.textContent = dtMultiplier.toFixed(0);
+        timestepSlider.value = baseDt.toFixed(2);
+        timestepValueDisplay.textContent = baseDt.toFixed(2);
+        // Initialize remaining sliders to current values
+        dampingSlider.value = damping.toFixed(2);
+        dampingValueDisplay.textContent = damping.toFixed(2);
+        spinSlider.value = spin.toFixed(2);
+        spinValueDisplay.textContent = spin.toFixed(2);
+        radiateSlider.value = radiateCoeff.toFixed(3);
+        radiateValueDisplay.textContent = radiateCoeff.toFixed(3);
         // New: initialize substeps UI
         substepsSlider.value = SUBSTEPS.toString();
         substepsValueDisplay.textContent = SUBSTEPS.toString();
@@ -288,11 +298,11 @@
 
         // ---- Uniform Buffers ----
         // Sim params: [dt, G, R, spin, eps, damping, numParticlesF, radiateCoeff]
-        const simParamsData = new Float32Array([DT, G, R, spin, EPS, damping, particleCount, radiateCoeff]);
+        const simParamsData = new Float32Array([baseDt, G, R, spin, EPS, damping, particleCount, radiateCoeff]);
         const simParamsBuffer = device.createBuffer({ size: simParamsData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         function writeSimParams() {
             // Do not scale G by massScale; keep R scaled to balance repulsion if desired
-            simParamsData[0] = DT;
+            simParamsData[0] = baseDt;
             simParamsData[1] = G;           // G unscaled
             simParamsData[2] = R / massScale; // R scaled (unchanged)
             simParamsData[3] = spin / SUBSTEPS; // spin scaled by inverse of SUBSTEPS
@@ -433,7 +443,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         const comReduce2BG = device.createBindGroup({
             layout: comReduce2Pipeline.getBindGroupLayout(0),
-            entries: [
+            entries:
+            [
                 { binding: 0, resource: { buffer: comPartialsBuffer } },
                 { binding: 1, resource: { buffer: comBuffer } },
                 { binding: 2, resource: { buffer: simParamsBuffer } },
@@ -1055,8 +1066,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         function frame() {
             const frameStart = performance.now();
             // Match nbody2.html timing tweaks
-            if (loopCount > 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
-            if (loopCount > 256) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
+            if (loopCount === 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
+            if (loopCount === 256) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
 
             // Update matrices if size changed
             projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
@@ -1081,7 +1092,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             }
 
             // Per-substep params: dt and damping scaled
-            const dtSub = dtMultiplier / SUBSTEPS;
+            const dtSub = baseDt / SUBSTEPS;
             const dampingSub = Math.pow(damping, 1.0 * dtSub);
             const effectiveG = G;           // G unscaled per request
             const effectiveR = R / massScale;
@@ -1209,7 +1220,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             // Update global readFromA for next frame
             readFromA = localReadFromA;
 
-            loopCount+=dtMultiplier;
+            loopCount+=1;
             lastFrameMs = performance.now() - frameStart;
             updateDebug();
             requestAnimationFrame(frame);
