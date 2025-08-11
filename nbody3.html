@@ -88,10 +88,10 @@
         window.addEventListener('resize', resizeCanvas);
 
         // ---- Simulation Parameters ----
-        const NUM_PARTICLES = 512*100; // must be multiple of 100 per original
+        const NUM_PARTICLES = 128*100; // must be multiple of 100 per original
         let G = 0.3;
         const R = 10000.0;
-        let spin = 0.03;
+        let spin = 0.3;
         const EPS = 0.001;
         let damping = 0.9;
         const stride = 4; // vec4 per particle
