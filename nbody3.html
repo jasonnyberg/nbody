@@ -534,7 +534,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   }
   let hasMass: bool = isActive && (mi > 0.0);
 
-  var force: vec3<f32> = vec3<f32>(0.0);
+  // Accumulate acceleration directly (avoid multiplying by mi and dividing later)
+  var acc: vec3<f32> = vec3<f32>(0.0);
   var radiate_mag: f32 = 0.0;
 
   var base: u32 = 0u;
@@ -579,21 +580,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             let invSoft2 = invSoft * invSoft;       // 1/soft^2
             let invSoft6 = invSoft2 * invSoft2 * invSoft2; // 1/soft^6
 
-            // Force magnitudes
-            let attractiveF = Gc * mi * mj * invSoft2;
-            // Apply extra repulsion factor for particle i
-            let repulsiveF  = (Rc * mi * mj * invSoft6) * max(1.0, repulse_i);
+            // Acceleration magnitudes (depend only on mj)
+            let a_attract = Gc * mj * invSoft2;
+            let a_repulse = (Rc * mj * invSoft6) * max(1.0, repulse_i);
 
-            // Radiative damping modeled as acceleration; convert to force by multiplying with mi
-            var radiateAccel: f32 = 0.0;
-            if (repulsiveF > attractiveF) {
+            // Radiative damping modeled as acceleration
+            var a_radiate: f32 = 0.0;
+            if (a_repulse > a_attract) {
               let closingSpeed = dot(diff, vel - vj);
-              radiateAccel = Rcvt * closingSpeed * invSoft; // acceleration units
+              a_radiate = Rcvt * closingSpeed * invSoft; // acceleration units
             }
 
-            let fmagF = attractiveF - repulsiveF - (radiateAccel * mi);
-            radiate_mag = radiate_mag + abs(radiateAccel);
-            force = force + dir * fmagF;
+            let a_net = a_attract - a_repulse - a_radiate;
+            radiate_mag = radiate_mag + abs(a_radiate);
+            acc = acc + dir * a_net;
           }
         }
         k = k + 1u;
@@ -622,8 +622,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     }
 
     if (hasMass) {
-      // Convert accumulated force to acceleration by dividing with mi
-      var v = (vel + ((force / max(mi, 1e-6)) + spinAccel) * params.dt) * params.damping;
+      // Integrate with acceleration directly (no divide by mi)
+      var v = (vel + (acc + spinAccel) * params.dt) * params.damping;
       var p = pos + v * params.dt;
       posOut.data[i] = vec4<f32>(p, radiate_mag);
       velOut.data[i] = vec4<f32>(v, 0.0);
@@ -721,7 +721,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
           let dp = tilePos[k].xyz - p_i;
           let d2 = dot(dp, dp);
 
-          // Evaluate repulsive vs attractive force using same model as integrator
+          // Softened distance terms
           let eps2 = params.eps * params.eps;
           let soft2 = d2 + eps2;
           let invSoft = inverseSqrt(soft2);
@@ -729,18 +729,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
           let invSoft6 = invSoft2 * invSoft2 * invSoft2;
           let Gc = params.G;
           let Rc = params.R;
-          let attractiveF = Gc * mi0 * mj * invSoft2;
-          let repulsiveF  = Rc * mi0 * mj * invSoft6;
 
-          // Approaching if distance is shrinking: d/dt(|dp|^2) = 2 dp·(v_j - v_i) < 0  =>  dp·(v_i - v_j) > 0
+          // Use mass-independent magnitudes for comparison (mi*mj cancels)
+          let attractiveM = Gc * invSoft2;
+          let repulsiveM  = Rc * invSoft6;
+
+          // Approaching if distance is shrinking: dp·(v_i - v_j) > 0
           let rel = v_i - tileVel[k].xyz;
           let approaching = dot(dp, rel) > 0.0;
 
           // Depth threshold (higher fusionFactor => easier to fuse)
-          let ratio = repulsiveF / max(attractiveF, 1e-12);
+          let ratio = repulsiveM / max(attractiveM, 1e-12);
           let req = 1.0 + (1.0 / max(fparams.fusionFactor, 1e-6));
 
-          if (approaching && repulsiveF > attractiveF && ratio >= req) {
+          if (approaching && repulsiveM > attractiveM && ratio >= req) {
             if (!found || d2 < bestD2) {
               bestD2 = d2;
               bestJ = j;
