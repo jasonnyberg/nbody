@@ -33,11 +33,29 @@
     </div>
     <div style="position: fixed; top: 160px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
         <label for="radiateSlider">Radiative: <span id="radiateValue">0.005</span></label><br>
-        <input type="range" id="radiateSlider" min="0.0" max="0.1" step="0.001" value="0.00m5">
+        <input type="range" id="radiateSlider" min="0.0" max="0.1" step="0.001" value="0.005">
     </div>
     <div style="position: fixed; top: 210px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
         <label for="fusionSlider">Fusion: <span id="fusionValue">0.01</span></label><br>
         <input type="range" id="fusionSlider" min="0.01" max="5.00" step="0.01" value="0.01">
+    </div>
+    <div style="position: fixed; top: 260px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="timestepSlider">Timestep: <span id="timestepValue">1.0</span></label><br>
+        <input type="range" id="timestepSlider" min="0.1" max="10.0" step="0.1" value="1.0">
+    </div>
+    <!-- New: Substeps slider -->
+    <div style="position: fixed; top: 310px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="substepsSlider">Substeps: <span id="substepsValue">4</span></label><br>
+        <input type="range" id="substepsSlider" min="1" max="16" step="1" value="4">
+    </div>
+    <!-- New: Fusion energy/decay controls -->
+    <div style="position: fixed; top: 360px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="boostSlider">Fusion Boost: <span id="boostValue">2.0</span></label><br>
+        <input type="range" id="boostSlider" min="1.0" max="5.0" step="0.1" value="2.0">
+    </div>
+    <div style="position: fixed; top: 410px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="decaySlider">Decay Half-life: <span id="decayValue">1.0</span></label><br>
+        <input type="range" id="decaySlider" min="0.05" max="10.0" step="0.05" value="1.0">
     </div>
 
     <script type="text/javascript">
@@ -71,7 +89,7 @@
 
         // ---- Simulation Parameters ----
         const NUM_PARTICLES = 512*100; // must be multiple of 100 per original
-        const DT = 0.2;
+        const DT = 1.0;
         let G = 0.3;
         const R = 10000.0;
         let spin = 0.03;
@@ -80,8 +98,13 @@
         const stride = 4; // vec4 per particle
         const radius = 1000.0;
         const cam_dist = 1000.0;
-        const SUBSTEPS = 4; // physics substeps per rendered frame
+        // Changed: SUBSTEPS is now runtime-adjustable via UI
+        let SUBSTEPS = 4; // physics substeps per rendered frame
         let radiateCoeff = 0.005; // radiative damping coefficient
+        let dtMultiplier = 1.0;   // timestep scale factor from slider (1..10)
+        // New: emission parameters
+        let fusionBoost = 2.0;    // boost factor applied to survivor's repulsion on fusion
+        let decayHalfLife = 1.0;  // half-life (simulation time units) for emission decay
         let loopCount = 0;
         const startTime = performance.now();
         let lastFrameMs = 0;
@@ -106,12 +129,47 @@
         const fusionSlider = document.getElementById('fusionSlider');
         const fusionValueDisplay = document.getElementById('fusionValue');
         fusionSlider.addEventListener('input', (e) => { fusionFactor = parseFloat(e.target.value); fusionValueDisplay.textContent = fusionFactor.toFixed(2); writeFusionParams(); });
+        const timestepSlider = document.getElementById('timestepSlider');
+        const timestepValueDisplay = document.getElementById('timestepValue');
+        timestepSlider.addEventListener('input', (e) => { dtMultiplier = parseFloat(e.target.value); timestepValueDisplay.textContent = dtMultiplier.toFixed(1); });
+        // New: substeps slider
+        const substepsSlider = document.getElementById('substepsSlider');
+        const substepsValueDisplay = document.getElementById('substepsValue');
+        substepsSlider.addEventListener('input', (e) => {
+            SUBSTEPS = parseInt(e.target.value, 10);
+            substepsValueDisplay.textContent = SUBSTEPS.toString();
+            writeSimParams();
+        });
+        // New: fusion boost slider
+        const boostSlider = document.getElementById('boostSlider');
+        const boostValueDisplay = document.getElementById('boostValue');
+        boostSlider.addEventListener('input', (e) => {
+            fusionBoost = Math.max(1.0, parseFloat(e.target.value));
+            boostValueDisplay.textContent = fusionBoost.toFixed(1);
+        });
+        // New: decay half-life slider
+        const decaySlider = document.getElementById('decaySlider');
+        const decayValueDisplay = document.getElementById('decayValue');
+        decaySlider.addEventListener('input', (e) => {
+            decayHalfLife = Math.max(0.001, parseFloat(e.target.value));
+            decayValueDisplay.textContent = decayHalfLife.toFixed(2);
+        });
 
         // Ensure initial values are reflected in UI at startup (uniforms are written later after buffers are created)
         gSlider.value = G.toFixed(2);
         gValueDisplay.textContent = G.toFixed(2);
         fusionSlider.value = fusionFactor.toFixed(2);
         fusionValueDisplay.textContent = fusionFactor.toFixed(2);
+        timestepSlider.value = dtMultiplier.toFixed(0);
+        timestepValueDisplay.textContent = dtMultiplier.toFixed(0);
+        // New: initialize substeps UI
+        substepsSlider.value = SUBSTEPS.toString();
+        substepsValueDisplay.textContent = SUBSTEPS.toString();
+        // New: initialize emission UI
+        boostSlider.value = fusionBoost.toFixed(1);
+        boostValueDisplay.textContent = fusionBoost.toFixed(1);
+        decaySlider.value = decayHalfLife.toFixed(2);
+        decayValueDisplay.textContent = decayHalfLife.toFixed(2);
 
         // ---- Helpers ----
         function perspectiveMatrix(fov, aspect, near, far) {
@@ -202,6 +260,18 @@
         // New: per-frame fuse flags for flash visualization
         const fuseFlagsBuffer = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         const zeroFuseFlags = new Float32Array(particleCount);
+        // New: per-particle extra repulsion factors (>= 1.0); boosted on fusion and decays each physics pass
+        const repulseInit = new Float32Array(particleCount); repulseInit.fill(1.0);
+        const repulseBuffer = createBufferFromArray(repulseInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+        // New: emission params uniform (boost, decayFactor)
+        const emissionParamsData = new Float32Array([fusionBoost, 1.0, 0.0, 0.0]);
+        const emissionParamsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        function writeEmissionParams() {
+            emissionParamsData[0] = fusionBoost;
+            emissionParamsData[1] = decayHalfLife;
+            device.queue.writeBuffer(emissionParamsBuffer, 0, emissionParamsData.buffer, emissionParamsData.byteOffset, emissionParamsData.byteLength);
+        }
+        writeEmissionParams();
         // New: dynamic mass stats (active count and max mass) computed on GPU each frame
         const totalMass = massSum;
         let dynActiveCount = particleCount;
@@ -225,7 +295,7 @@
             simParamsData[0] = DT;
             simParamsData[1] = G;           // G unscaled
             simParamsData[2] = R / massScale; // R scaled (unchanged)
-            simParamsData[3] = spin;
+            simParamsData[3] = spin / SUBSTEPS; // spin scaled by inverse of SUBSTEPS
             simParamsData[4] = EPS;
             simParamsData[5] = damping;
             simParamsData[6] = particleCount;
@@ -410,6 +480,7 @@ struct SimParams {
 struct Vec4Buffer { data: array<vec4<f32>>, }
 struct Single { data: vec4<f32>, }
 struct FloatBuffer { data: array<f32>, }
+struct EmissionParams { boost: f32, decayFactor: f32, _pad0: f32, _pad1: f32 }
 
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buffer;
 @group(0) @binding(1) var<storage, read> velIn: Vec4Buffer;
@@ -418,6 +489,8 @@ struct FloatBuffer { data: array<f32>, }
 @group(0) @binding(4) var<uniform> params: SimParams;
 @group(0) @binding(5) var<storage, read> comIn: Single;
 @group(0) @binding(6) var<storage, read> masses: FloatBuffer;
+@group(0) @binding(7) var<storage, read_write> repulse: FloatBuffer; // extra repulsion factor per particle
+@group(0) @binding(8) var<uniform> emission: EmissionParams;
 
 const TILE_SIZE: u32 = 256u;
 var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
@@ -441,15 +514,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   var pos: vec3<f32> = vec3<f32>(0.0);
   var vel: vec3<f32> = vec3<f32>(0.0);
   var mi: f32 = 1.0;
+  var repulse_i: f32 = 1.0;
   if (isActive) {
     pos = posIn.data[i].xyz;
     vel = velIn.data[i].xyz;
     mi = masses.data[i];
+    repulse_i = repulse.data[i];
   }
   let hasMass: bool = isActive && (mi > 0.0);
 
   var force: vec3<f32> = vec3<f32>(0.0);
-  var acc: vec3<f32> = vec3<f32>(0.0);
   var radiate_mag: f32 = 0.0;
 
   var base: u32 = 0u;
@@ -473,7 +547,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     var tileCount: u32 = TILE_SIZE;
     if (remaining < TILE_SIZE) { tileCount = remaining; }
 
-    if (isActive) {
+    // Only massive particles accumulate forces; zero-mass particles do nothing
+    if (hasMass) {
       var k: u32 = 0u;
       loop {
         if (k >= tileCount) { break; }
@@ -493,9 +568,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             let invSoft2 = invSoft * invSoft;       // 1/soft^2
             let invSoft6 = invSoft2 * invSoft2 * invSoft2; // 1/soft^6
 
-            // Force/accel magnitudes
+            // Force magnitudes
             let attractiveF = Gc * mi * mj * invSoft2;
-            let repulsiveF  = Rc * mi * mj * invSoft6;
+            // Apply extra repulsion factor for particle i
+            let repulsiveF  = (Rc * mi * mj * invSoft6) * max(1.0, repulse_i);
 
             // Radiative damping modeled as acceleration; convert to force by multiplying with mi
             var radiateAccel: f32 = 0.0;
@@ -504,18 +580,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
               radiateAccel = Rcvt * closingSpeed * invSoft; // acceleration units
             }
 
-            if (hasMass) {
-              let fmagF = attractiveF - repulsiveF - (radiateAccel * mi);
-              radiate_mag = radiate_mag + abs(radiateAccel);
-              force = force + dir * fmagF;
-            } else {
-              // massless test particle: accumulate acceleration directly (independent of mi)
-              let attractiveA = Gc * mj * invSoft2;
-              let repulsiveA  = Rc * mj * invSoft6;
-              let amag = attractiveA - repulsiveA - radiateAccel;
-              radiate_mag = radiate_mag + abs(radiateAccel);
-              acc = acc + dir * amag;
-            }
+            let fmagF = attractiveF - repulsiveF - (radiateAccel * mi);
+            radiate_mag = radiate_mag + abs(radiateAccel);
+            force = force + dir * fmagF;
           }
         }
         k = k + 1u;
@@ -544,18 +611,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     }
 
     if (hasMass) {
-      // Convert accumulated mass-weighted force to acceleration by dividing with mi
+      // Convert accumulated force to acceleration by dividing with mi
       var v = (vel + ((force / max(mi, 1e-6)) + spinAccel) * params.dt) * params.damping;
       var p = pos + v * params.dt;
       posOut.data[i] = vec4<f32>(p, radiate_mag);
       velOut.data[i] = vec4<f32>(v, 0.0);
     } else {
-      // Massless test particle integration using direct acceleration
-      var v = (vel + (acc + spinAccel) * params.dt) * params.damping;
-      var p = pos + v * params.dt;
-      posOut.data[i] = vec4<f32>(p, radiate_mag);
-      velOut.data[i] = vec4<f32>(v, 0.0);
+      // Zero-mass particles: do not integrate, do not act as test particles
+      posOut.data[i] = posIn.data[i];
+      velOut.data[i] = velIn.data[i];
     }
+
+    // Decay extra repulsion factor toward 1.0 each physics pass using per-substep decayFactor
+    let excess = max(0.0, repulse_i - 1.0);
+    let decayed = excess * emission.decayFactor;
+    repulse.data[i] = 1.0 + decayed;
   }
 }
 `;
@@ -570,6 +640,7 @@ struct FusionParams { fuseRadius: f32, minRelSpeed: f32, fusionFactor: f32, _pad
 struct Vec4Buffer { data: array<vec4<f32>>, }
 struct FloatBuffer { data: array<f32>, }
 struct Claims { data: array<atomic<u32>>, }
+struct EmissionParams { boost: f32, decayFactor: f32, _pad0: f32, _pad1: f32 }
 
 @group(0) @binding(0) var<storage, read_write> positions: Vec4Buffer;
 @group(0) @binding(1) var<storage, read_write> velocities: Vec4Buffer;
@@ -578,6 +649,8 @@ struct Claims { data: array<atomic<u32>>, }
 @group(0) @binding(4) var<uniform> fparams: FusionParams;
 @group(0) @binding(5) var<storage, read_write> claims: Claims;
 @group(0) @binding(6) var<storage, read_write> fuseFlags: FloatBuffer; // new: flash flags
+@group(0) @binding(7) var<storage, read_write> repulse: FloatBuffer;   // new: extra repulsion factor
+@group(0) @binding(8) var<uniform> emission: EmissionParams;           // boost/decay params
 
 const TILE_SIZE: u32 = 256u;
 var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
@@ -700,6 +773,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 
               // Flag survivor for white flash this frame
               fuseFlags.data[i] = 1.0;
+
+              // Boost extra repulsion on survivor to simulate emitted energy using UI-controlled boost
+              let boost = max(1.0, emission.boost);
+              let cur = repulse.data[i];
+              repulse.data[i] = max(cur, boost);
+              // Reset consumed particle
+              repulse.data[bestJ] = 1.0;
             }
           }
         }
@@ -727,7 +807,7 @@ struct FloatBuffer { data: array<f32>, }
 @group(0) @binding(1) var<uniform> mats: Matrices;
 @group(0) @binding(2) var<storage, read> comIn: Single;
 @group(0) @binding(3) var<storage, read> masses: FloatBuffer;
-@group(0) @binding(4) var<storage, read> fuseFlags: FloatBuffer; // new: flash flags
+@group(0) @binding(4) var<storage, read> fuseFlags: FloatBuffer;
 
 struct VSOut {
   @builtin(position) position: vec4<f32>,
@@ -740,47 +820,36 @@ struct VSOut {
 @vertex
 fn vs_main(@location(0) corner: vec2<f32>, @builtin(instance_index) instance: u32) -> VSOut {
   let pos4 = positions.data[instance];
-  let c = comIn.data.xyz;
   let m = masses.data[instance];
-  // Logarithmic normalization for better spread across mass range
-  let invLogMax = mats._pad; // stores 1 / log(1 + maxMass)
+  if (m <= 0.0) { // Cull in vertex stage to avoid fragment work
+    // Place off-screen with zero alpha; fragment will discard by radius anyway
+    var o: VSOut;
+    o.position = vec4<f32>(-2.0, -2.0, 0.0, 1.0);
+    o.radiate = 0.0; o.corner = corner; o.massNorm = 0.0; o.fused = 0.0;
+    return o;
+  }
+  let c = comIn.data.xyz;
+  let invLogMax = mats._pad;
   let mNorm = clamp(log(1.0 + m) * invLogMax, 0.0, 1.0);
   let world = vec4<f32>(pos4.xyz - c, 1.0);
   let viewPos = mats.view * world;
   let clipCenter = mats.projection * viewPos;
-
-  // size scaled by log-normalized mass
   let sizePx = max(2.0, (mNorm + 0.2) * mats.sizeScale / max(1.0, -viewPos.z));
   let offsetNDC = (corner * sizePx) * vec2<f32>(2.0 / mats.viewportSize.x, 2.0 / mats.viewportSize.y);
   let offset = offsetNDC * clipCenter.w;
-
   var out: VSOut;
   out.position = vec4<f32>(clipCenter.xy + offset, clipCenter.zw);
-  out.radiate = pos4.w;
-  out.corner = corner;
-  out.massNorm = mNorm;
-  out.fused = fuseFlags.data[instance];
+  out.radiate = pos4.w; out.corner = corner; out.massNorm = mNorm; out.fused = fuseFlags.data[instance];
   return out;
 }
 
 @fragment
 fn fs_main(@location(0) radiate: f32, @location(1) corner: vec2<f32>, @location(2) massNorm: f32, @location(3) fused: f32) -> @location(0) vec4<f32> {
-  let r = length(corner);
-  if (r > 1.0) { discard; }
+  let r = length(corner); if (r > 1.0) { discard; }
   let alpha = smoothstep(0.7, 0.0, r);
-
-  // Flash newly fused survivors as bright white this frame
-  if (fused > 0.0) {
-    return vec4<f32>(1.0, 1.0, 1.0, alpha);
-  }
-
-  // Do not render zero-mass particles
-  if (massNorm == 0.0) { discard; }
-
-  // green channel encodes mass, blue from (1 - mass), red from radiative magnitude
-  let g = massNorm;
-  let b = 1.0 - massNorm;
-  let rad = clamp(5.0 * radiate, 0.0, 1.0);
+  if (massNorm == 0.0) { discard; } // zero-mass culled
+  if (fused > 0.0) { return vec4<f32>(1.0, 1.0, 1.0, alpha); }
+  let g = massNorm; let b = 1.0 - massNorm; let rad = clamp(5.0 * radiate, 0.0, 1.0);
   return vec4<f32>(rad, g, b, alpha);
 }
 `;
@@ -897,6 +966,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 { binding: 4, resource: { buffer: simParamsBuffer } },
                 { binding: 5, resource: { buffer: comBuffer } },
                 { binding: 6, resource: { buffer: massBuffer } },
+                { binding: 7, resource: { buffer: repulseBuffer } },
+                { binding: 8, resource: { buffer: emissionParamsBuffer } },
             ]
         });
         const computeBG_BtoA = device.createBindGroup({
@@ -909,6 +980,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 { binding: 4, resource: { buffer: simParamsBuffer } },
                 { binding: 5, resource: { buffer: comBuffer } },
                 { binding: 6, resource: { buffer: massBuffer } },
+                { binding: 7, resource: { buffer: repulseBuffer } },
+                { binding: 8, resource: { buffer: emissionParamsBuffer } },
             ]
         });
 
@@ -923,6 +996,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 { binding: 4, resource: { buffer: fusionParamsBuffer } },
                 { binding: 5, resource: { buffer: claimsBuffer } },
                 { binding: 6, resource: { buffer: fuseFlagsBuffer } },
+                { binding: 7, resource: { buffer: repulseBuffer } },
+                { binding: 8, resource: { buffer: emissionParamsBuffer } },
             ]
         });
         const fusionBG_posB = device.createBindGroup({
@@ -935,6 +1010,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 { binding: 4, resource: { buffer: fusionParamsBuffer } },
                 { binding: 5, resource: { buffer: claimsBuffer } },
                 { binding: 6, resource: { buffer: fuseFlagsBuffer } },
+                { binding: 7, resource: { buffer: repulseBuffer } },
+                { binding: 8, resource: { buffer: emissionParamsBuffer } },
             ]
         });
 
@@ -978,8 +1055,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         function frame() {
             const frameStart = performance.now();
             // Match nbody2.html timing tweaks
-            if (loopCount === 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
-            if (loopCount === 256) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
+            if (loopCount > 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
+            if (loopCount > 256) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
 
             // Update matrices if size changed
             projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
@@ -1004,19 +1081,25 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             }
 
             // Per-substep params: dt and damping scaled
-            const dtSub = DT / SUBSTEPS;
-            const dampingSub = Math.pow(damping, 1.0 / SUBSTEPS);
+            const dtSub = dtMultiplier / SUBSTEPS;
+            const dampingSub = Math.pow(damping, 1.0 * dtSub);
             const effectiveG = G;           // G unscaled per request
             const effectiveR = R / massScale;
             simParamsData[0] = dtSub;      // dt
             simParamsData[1] = effectiveG; // G
             simParamsData[2] = effectiveR; // R scaled to match
-            simParamsData[3] = spin;       // spin (unchanged)
+            simParamsData[3] = spin * dtSub; // spin scaled by dtSub
             simParamsData[4] = EPS;        // eps (unchanged)
             simParamsData[5] = dampingSub; // per-substep damping
             simParamsData[6] = particleCount;
             simParamsData[7] = radiateCoeff; // radiative damping
             device.queue.writeBuffer(simParamsBuffer, 0, simParamsData.buffer, simParamsData.byteOffset, simParamsData.byteLength);
+
+            // New: compute per-substep decay factor based on half-life and dtSub, and write emission params
+            const decayFactor = Math.exp(-Math.LN2 * (dtSub / Math.max(1e-6, decayHalfLife)));
+            emissionParamsData[0] = fusionBoost; // boost
+            emissionParamsData[1] = decayFactor; // per-substep decay factor
+            device.queue.writeBuffer(emissionParamsBuffer, 0, emissionParamsData.buffer, emissionParamsData.byteOffset, emissionParamsData.byteLength);
 
             // Compute passes: SUBSTEPS sub-iterations, ping-ponging A/B
             let localReadFromA = readFromA;
@@ -1126,7 +1209,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             // Update global readFromA for next frame
             readFromA = localReadFromA;
 
-            loopCount++;
+            loopCount+=dtMultiplier;
             lastFrameMs = performance.now() - frameStart;
             updateDebug();
             requestAnimationFrame(frame);
