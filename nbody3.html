@@ -1119,7 +1119,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             const frameStart = performance.now();
             // Match nbody2.html timing tweaks (kept as single-shot changes)
             if (loopCount === 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
-            if (loopCount === 256) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
+            if (loopCount === 150) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
 
             // Update matrices if size changed
             projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
