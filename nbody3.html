@@ -331,19 +331,22 @@ struct SimParams {
 struct Vec4Buffer { data: array<vec4<f32>>, }
 struct FloatBuffer { data: array<f32>, }
 struct Partials { data: array<vec4<f32>>, }
+struct Single { data: vec4<f32>, }
 @group(0) @binding(0) var<storage, read> positions: Vec4Buffer;
 @group(0) @binding(1) var<storage, read_write> partials: Partials;
 @group(0) @binding(2) var<uniform> params: SimParams;
 @group(0) @binding(3) var<storage, read> masses: FloatBuffer;
+@group(0) @binding(4) var<storage, read> anchor: Single; // smoothed COM as anchor for numerical stability
 const WG: u32 = 256u;
-var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*pos), w = sum(m)
+var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*(pos-anchor)), w = sum(m)
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let i = wid.x * WG + lid.x;
   let n = u32(params.numParticlesF);
+  let a = anchor.data.xyz;
   var accum = vec4<f32>(0.0);
   if (i < n) {
-    let p = positions.data[i].xyz;
+    let p = positions.data[i].xyz - a;
     let m = masses.data[i];
     accum = vec4<f32>(p * m, m);
   }
@@ -369,8 +372,9 @@ struct Single { data: vec4<f32>, }
 @group(0) @binding(0) var<storage, read> partials: Partials;
 @group(0) @binding(1) var<storage, read_write> comOut: Single;
 @group(0) @binding(2) var<uniform> params: SimParams;
+@group(0) @binding(3) var<storage, read> anchor: Single; // same anchor as pass 1
 const WG: u32 = 256u;
-var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*pos), w = sum(m)
+var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*(pos-anchor)), w = sum(m)
 @compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   let n = u32(params.numParticlesF);
@@ -392,10 +396,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     stride = stride / 2u;
   }
   if (lid.x == 0u) {
-    let invM = select(0.0, 1.0 / s[0u].w, s[0u].w > 0.0);
-    let com = s[0u].xyz * invM;
-    // Store total mass in w for downstream camera tracker
-    comOut.data = vec4<f32>(com, s[0u].w);
+    let a = anchor.data.xyz;
+    let totalM = s[0u].w;
+    let invM = select(0.0, 1.0 / totalM, totalM > 0.0);
+    let com = a + s[0u].xyz * invM;
+    comOut.data = vec4<f32>(com, totalM);
   }
 }
 `;
@@ -412,6 +417,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 { binding: 1, resource: { buffer: comPartialsBuffer } },
                 { binding: 2, resource: { buffer: simParamsBuffer } },
                 { binding: 3, resource: { buffer: massBuffer } },
+                { binding: 4, resource: { buffer: smoothComBuffer } },
             ],
         });
         const comReduce1BG_B = device.createBindGroup({
@@ -421,6 +427,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 { binding: 1, resource: { buffer: comPartialsBuffer } },
                 { binding: 2, resource: { buffer: simParamsBuffer } },
                 { binding: 3, resource: { buffer: massBuffer } },
+                { binding: 4, resource: { buffer: smoothComBuffer } },
             ],
         });
 
@@ -431,6 +438,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 { binding: 0, resource: { buffer: comPartialsBuffer } },
                 { binding: 1, resource: { buffer: comBuffer } },
                 { binding: 2, resource: { buffer: simParamsBuffer } },
+                { binding: 3, resource: { buffer: smoothComBuffer } },
             ]
         });
 
@@ -443,8 +451,12 @@ struct Single { data: vec4<f32>, }
 fn main() {
   let c = comIn.data.xyz;
   let s0 = smoothOut.data.xyz;
-  let alpha: f32 = 0.10; // smoothing factor per rendered frame
-  let s1 = s0 + (c - s0) * alpha; // linear interpolation
+  let d = length(c - s0);
+  // Adaptive smoothing: when far from target, increase alpha toward 1 to quickly catch up;
+  // when close, keep alpha ~0.1 to avoid jitter. k controls transition scale.
+  let k: f32 = 10000.0;
+  let alpha: f32 = clamp(0.10 + 0.90 * (d / (d + k)), 0.10, 1.0);
+  let s1 = s0 + (c - s0) * alpha;
   smoothOut.data = vec4<f32>(s1, 1.0);
 }
 `;
@@ -485,7 +497,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             layout: recenterPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: posA } },
-                { binding: 1, resource: { buffer: comBuffer } }, // use latest COM (unsmoothed)
+                { binding: 1, resource: { buffer: smoothComBuffer } }, // use smoothed COM for consistent tracking
                 { binding: 2, resource: { buffer: simParamsBuffer } },
             ]
         });
@@ -493,7 +505,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             layout: recenterPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: { buffer: posB } },
-                { binding: 1, resource: { buffer: comBuffer } },
+                { binding: 1, resource: { buffer: smoothComBuffer } },
                 { binding: 2, resource: { buffer: simParamsBuffer } },
             ]
         });
@@ -1025,7 +1037,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 { binding: 2, resource: { buffer: posB } },
                 { binding: 3, resource: { buffer: velB } },
                 { binding: 4, resource: { buffer: simParamsBuffer } },
-                { binding: 5, resource: { buffer: comBuffer } },
+                { binding: 5, resource: { buffer: smoothComBuffer } },
                 { binding: 6, resource: { buffer: massBuffer } },
                 { binding: 7, resource: { buffer: repulseBuffer } },
                 { binding: 8, resource: { buffer: emissionParamsBuffer } },
@@ -1039,7 +1051,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                 { binding: 2, resource: { buffer: posA } },
                 { binding: 3, resource: { buffer: velA } },
                 { binding: 4, resource: { buffer: simParamsBuffer } },
-                { binding: 5, resource: { buffer: comBuffer } },
+                { binding: 5, resource: { buffer: smoothComBuffer } },
                 { binding: 6, resource: { buffer: massBuffer } },
                 { binding: 7, resource: { buffer: repulseBuffer } },
                 { binding: 8, resource: { buffer: emissionParamsBuffer } },
@@ -1141,6 +1153,36 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
               p2.setBindGroup(0, comReduce2BG);
               p2.dispatchWorkgroups(1);
               p2.end();
+
+              // Smooth COM before integration so spin uses smoothed center
+              const ps0 = encoder.beginComputePass();
+              ps0.setPipeline(comSmoothPipeline);
+              ps0.setBindGroup(0, comSmoothBG);
+              ps0.dispatchWorkgroups(1);
+              ps0.end();
+
+              // Recenter positions around smoothed COM to reduce catastrophic cancellation when spread out
+              // and then zero the smoothed COM so downstream passes operate in the centered frame
+              {
+                const wgCount = Math.ceil(particleCount / 256);
+                const prA = encoder.beginComputePass();
+                prA.setPipeline(recenterPipeline);
+                prA.setBindGroup(0, recenterBG_posA);
+                prA.dispatchWorkgroups(wgCount);
+                prA.end();
+
+                const prB = encoder.beginComputePass();
+                prB.setPipeline(recenterPipeline);
+                prB.setBindGroup(0, recenterBG_posB);
+                prB.dispatchWorkgroups(wgCount);
+                prB.end();
+
+                const pz = encoder.beginComputePass();
+                pz.setPipeline(zeroSmoothPipeline);
+                pz.setBindGroup(0, zeroSmoothBG);
+                pz.dispatchWorkgroups(1);
+                pz.end();
+              }
             }
 
             // Per-frame params
@@ -1231,20 +1273,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
               ps.setBindGroup(0, comSmoothBG);
               ps.dispatchWorkgroups(1);
               ps.end();
-
-              // Recentering: translate all positions by -COM to keep coordinates near origin
-              const pr = encoder.beginComputePass();
-              pr.setPipeline(recenterPipeline);
-              pr.setBindGroup(0, localReadFromA ? recenterBG_posA : recenterBG_posB);
-              pr.dispatchWorkgroups(Math.ceil(particleCount / 256));
-              pr.end();
-
-              // Reset smoothed COM to zero since positions were recentred
-              const pz = encoder.beginComputePass();
-              pz.setPipeline(zeroSmoothPipeline);
-              pz.setBindGroup(0, zeroSmoothBG);
-              pz.dispatchWorkgroups(1);
-              pz.end();
             }
 
             // Render pass after last substep
