@@ -83,7 +83,7 @@
         window.addEventListener('resize', resizeCanvas);
 
         // ---- Simulation Parameters ----
-        const NUM_PARTICLES = 128*100; // must be multiple of 100 per original
+        const NUM_PARTICLES = 256*100; // must be multiple of 100 per original
         let G = 0.3;
         const R = 10000.0;
         let spin = 0.03;
@@ -235,8 +235,6 @@
         const maxMass = 1.0;
         const massSum = particleCount * 1.0;
         const avgMass = 1.0;
-        // Physics mass scale with uniform masses is 1
-        const massScale = 1.0;
         const massBuffer = createBufferFromArray(massesInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
         // Fusion claims buffer (atomic flags) and params
         const claimsBuffer = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
@@ -260,12 +258,6 @@
         // New: emission params uniform (boost, decayFactor)
         const emissionParamsData = new Float32Array([fusionBoost, 1.0, 0.0, 0.0]);
         const emissionParamsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        function writeEmissionParams() {
-            emissionParamsData[0] = fusionBoost;
-            emissionParamsData[1] = decayHalfLife;
-            device.queue.writeBuffer(emissionParamsBuffer, 0, emissionParamsData.buffer, emissionParamsData.byteOffset, emissionParamsData.byteLength);
-        }
-        writeEmissionParams();
         // New: dynamic mass stats (active count and max mass) computed on GPU each frame
         const totalMass = massSum;
         let dynActiveCount = particleCount;
@@ -287,7 +279,7 @@
         function writeSimParams() {
             simParamsData[0] = baseDt;     // dt per frame
             simParamsData[1] = G;          // G
-            simParamsData[2] = R / massScale; // R scaled (unchanged)
+            simParamsData[2] = R;          // R
             simParamsData[3] = spin;       // spin per frame (no substep scaling)
             simParamsData[4] = EPS;
             simParamsData[5] = damping;    // damping per frame
@@ -314,9 +306,12 @@
         const matricesBuffer = device.createBuffer({ size: matricesData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         writeMatrices();
 
+        // Shared WGSL constants (used in injected WGSL strings below)
+        const WG_SIZE = 256; // workgroup size for compute passes
+        const TILE_SIZE = WG_SIZE;
+
         // Center-of-mass buffers and pipelines
-        const COM_WG = 256;
-        const numComPartials = Math.ceil(particleCount / COM_WG);
+        const numComPartials = Math.ceil(particleCount / WG_SIZE);
         const comPartialsBuffer = device.createBuffer({ size: numComPartials * 16, usage: GPUBufferUsage.STORAGE });
         const comBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE });
         const smoothComBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
@@ -337,9 +332,9 @@ struct Single { data: vec4<f32>, }
 @group(0) @binding(2) var<uniform> params: SimParams;
 @group(0) @binding(3) var<storage, read> masses: FloatBuffer;
 @group(0) @binding(4) var<storage, read> anchor: Single; // smoothed COM as anchor for numerical stability
-const WG: u32 = 256u;
+const WG: u32 = ${WG_SIZE}u;
 var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*(pos-anchor)), w = sum(m)
-@compute @workgroup_size(256)
+@compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let i = wid.x * WG + lid.x;
   let n = u32(params.numParticlesF);
@@ -373,9 +368,9 @@ struct Single { data: vec4<f32>, }
 @group(0) @binding(1) var<storage, read_write> comOut: Single;
 @group(0) @binding(2) var<uniform> params: SimParams;
 @group(0) @binding(3) var<storage, read> anchor: Single; // same anchor as pass 1
-const WG: u32 = 256u;
+const WG: u32 = ${WG_SIZE}u;
 var<workgroup> s: array<vec4<f32>, WG>; // xyz = sum(m*(pos-anchor)), w = sum(m)
-@compute @workgroup_size(256)
+@compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   let n = u32(params.numParticlesF);
   let numPartials = (n + WG - 1u) / WG;
@@ -481,7 +476,7 @@ struct SimParams {
 @group(0) @binding(0) var<storage, read_write> positions: Vec4Buffer;
 @group(0) @binding(1) var<storage, read> comIn: Single;
 @group(0) @binding(2) var<uniform> params: SimParams;
-@compute @workgroup_size(256)
+@compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i: u32 = gid.x;
   let n: u32 = u32(params.numParticlesF);
@@ -551,12 +546,12 @@ struct EmissionParams { boost: f32, decayFactor: f32, _pad0: f32, _pad1: f32 }
 @group(0) @binding(7) var<storage, read_write> repulse: FloatBuffer; // extra repulsion factor per particle
 @group(0) @binding(8) var<uniform> emission: EmissionParams;
 
-const TILE_SIZE: u32 = 256u;
+const TILE_SIZE: u32 = ${TILE_SIZE}u;
 var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
 var<workgroup> tileVel: array<vec4<f32>, TILE_SIZE>;
 var<workgroup> tileMass: array<f32, TILE_SIZE>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(local_invocation_id)  lid: vec3<u32>) {
   let i: u32 = gid.x;
@@ -711,12 +706,12 @@ struct EmissionParams { boost: f32, decayFactor: f32, _pad0: f32, _pad1: f32 }
 @group(0) @binding(7) var<storage, read_write> repulse: FloatBuffer;   // new: extra repulsion factor
 @group(0) @binding(8) var<uniform> emission: EmissionParams;           // boost/decay params
 
-const TILE_SIZE: u32 = 256u;
+const TILE_SIZE: u32 = ${TILE_SIZE}u;
 var<workgroup> tilePos: array<vec4<f32>, TILE_SIZE>;
 var<workgroup> tileVel: array<vec4<f32>, TILE_SIZE>;
 var<workgroup> tileMass: array<f32, TILE_SIZE>;
 
-@compute @workgroup_size(256)
+@compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         @builtin(local_invocation_id) lid: vec3<u32>) {
   let i: u32 = gid.x;
@@ -984,10 +979,11 @@ struct Stats { activeCount: atomic<u32>, maxMassBits: atomic<u32>, pad0: u32, pa
 @group(0) @binding(0) var<storage, read> masses: FloatBuffer;
 @group(0) @binding(1) var<storage, read_write> stats: Stats;
 @group(0) @binding(2) var<uniform> params: SimParams;
-const WG: u32 = 256u;
+const WG: u32 = ${WG_SIZE}u;
 var<workgroup> sCount: array<u32, WG>;
 var<workgroup> sMax: array<f32, WG>;
-@compute @workgroup_size(256)
+
+@compute @workgroup_size(${WG_SIZE})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let i = wid.x * WG + lid.x;
   let n = u32(params.numParticlesF);
@@ -1141,55 +1137,36 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
             // Compute center of mass for spin center (using current read buffer)
             {
-              const bg1 = readFromA ? comReduce1BG_A : comReduce1BG_B;
-              const p1 = encoder.beginComputePass();
-              p1.setPipeline(comReduce1Pipeline);
-              p1.setBindGroup(0, bg1);
-              p1.dispatchWorkgroups(numComPartials);
-              p1.end();
+              // Smooth COM before integration so spin uses latest available center
+               const ps0 = encoder.beginComputePass();
+               ps0.setPipeline(comSmoothPipeline);
+               ps0.setBindGroup(0, comSmoothBG);
+               ps0.dispatchWorkgroups(1);
+               ps0.end();
 
-              const p2 = encoder.beginComputePass();
-              p2.setPipeline(comReduce2Pipeline);
-              p2.setBindGroup(0, comReduce2BG);
-              p2.dispatchWorkgroups(1);
-              p2.end();
+               // Recenter positions around smoothed COM to reduce catastrophic cancellation when spread out
+               // and then zero the smoothed COM so downstream passes operate in the centered frame
+               {
+                 const wgCount = Math.ceil(particleCount / WG_SIZE);
+                 const pr = encoder.beginComputePass();
+                 pr.setPipeline(recenterPipeline);
+                 pr.setBindGroup(0, readFromA ? recenterBG_posA : recenterBG_posB);
+                 pr.dispatchWorkgroups(wgCount);
+                 pr.end();
 
-              // Smooth COM before integration so spin uses smoothed center
-              const ps0 = encoder.beginComputePass();
-              ps0.setPipeline(comSmoothPipeline);
-              ps0.setBindGroup(0, comSmoothBG);
-              ps0.dispatchWorkgroups(1);
-              ps0.end();
-
-              // Recenter positions around smoothed COM to reduce catastrophic cancellation when spread out
-              // and then zero the smoothed COM so downstream passes operate in the centered frame
-              {
-                const wgCount = Math.ceil(particleCount / 256);
-                const prA = encoder.beginComputePass();
-                prA.setPipeline(recenterPipeline);
-                prA.setBindGroup(0, recenterBG_posA);
-                prA.dispatchWorkgroups(wgCount);
-                prA.end();
-
-                const prB = encoder.beginComputePass();
-                prB.setPipeline(recenterPipeline);
-                prB.setBindGroup(0, recenterBG_posB);
-                prB.dispatchWorkgroups(wgCount);
-                prB.end();
-
-                const pz = encoder.beginComputePass();
-                pz.setPipeline(zeroSmoothPipeline);
-                pz.setBindGroup(0, zeroSmoothBG);
-                pz.dispatchWorkgroups(1);
-                pz.end();
-              }
+                 const pz = encoder.beginComputePass();
+                 pz.setPipeline(zeroSmoothPipeline);
+                 pz.setBindGroup(0, zeroSmoothBG);
+                 pz.dispatchWorkgroups(1);
+                 pz.end();
+               }
             }
 
             // Per-frame params
             const dt = baseDt;
             const dampingFrame = damping;
             const effectiveG = G;
-            const effectiveR = R / massScale;
+            const effectiveR = R;
             simParamsData[0] = dt;           // dt
             simParamsData[1] = effectiveG;   // G
             simParamsData[2] = effectiveR;   // R
@@ -1208,7 +1185,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 
             // Single compute pass per frame (no substeps)
             let localReadFromA = readFromA;
-            const workgroupSize = 256;
+            const workgroupSize = WG_SIZE;
             const workgroupCount = Math.ceil(particleCount / workgroupSize);
             {
                 const cpass = encoder.beginComputePass();
@@ -1318,7 +1295,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             lastFrameMs = performance.now() - frameStart;
             updateDebug();
             requestAnimationFrame(frame);
-        }
+               }
         frame();
     })();
     </script>
