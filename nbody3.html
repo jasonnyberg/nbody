@@ -52,6 +52,10 @@
         <label for="decaySlider">Decay Half-life: <span id="decayValue">1.0</span></label><br>
         <input type="range" id="decaySlider" min="0.05" max="10.0" step="0.05" value="1.0">
     </div>
+    <div style="position: fixed; top: 410px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; color: white;">
+        <label for="fuseProbSlider">Fusion Probability: <span id="fuseProbValue">1.00</span></label><br>
+        <input type="range" id="fuseProbSlider" min="0.0" max="1.0" step="0.01" value="1.0">
+    </div>
 
     <script type="text/javascript">
     "use strict";
@@ -106,6 +110,7 @@
         // New: defaults for fusion energy emission/decay controls
         let fusionBoost = 2.0;     // default boost factor applied on fusion
         let decayHalfLife = 1.0;   // seconds; half-life for repulsion decay
+        let fusionProb = 1.0; // probability (0..1) applied to each qualified fusion event
 
         // UI wiring
         const gSlider = document.getElementById('gSlider');
@@ -143,6 +148,14 @@
             decayHalfLife = Math.max(0.001, parseFloat(e.target.value));
             decayValueDisplay.textContent = decayHalfLife.toFixed(2);
         });
+        // New: fusion probability slider
+        const fuseProbSlider = document.getElementById('fuseProbSlider');
+        const fuseProbValue = document.getElementById('fuseProbValue');
+        fuseProbSlider.addEventListener('input', (e) => {
+            fusionProb = Math.min(1.0, Math.max(0.0, parseFloat(e.target.value)));
+            fuseProbValue.textContent = fusionProb.toFixed(2);
+            writeFusionParams();
+        });
 
         // Ensure initial values are reflected in UI at startup (uniforms are written later after buffers are created)
         gSlider.value = G.toFixed(2);
@@ -164,6 +177,9 @@
         boostValueDisplay.textContent = fusionBoost.toFixed(1);
         decaySlider.value = decayHalfLife.toFixed(2);
         decayValueDisplay.textContent = decayHalfLife.toFixed(2);
+        // New: initialize probability UI
+        fuseProbSlider.value = fusionProb.toFixed(2);
+        fuseProbValue.textContent = fusionProb.toFixed(2);
 
         // ---- Helpers ----
         function perspectiveMatrix(fov, aspect, near, far) {
@@ -193,7 +209,42 @@
         function dot(a, b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
 
         let projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
-        let viewMatrix = lookAt([0, cam_dist/3, cam_dist], [0, 0, 0], [0, 1, 0]);
+        // Orbit camera state (around origin)
+        let orbitAz = 0.0;          // azimuth angle (radians)
+        let orbitEl = 0.6;          // elevation angle (radians)
+        let orbitDist = cam_dist;   // distance from origin
+        let viewMatrix = lookAt([0, orbitDist * Math.cos(orbitEl), orbitDist], [0,0,0], [0,1,0]);
+        function updateViewMatrix() {
+            const minEl = -Math.PI/2 + 0.01;
+            const maxEl =  Math.PI/2 - 0.01;
+            if (orbitEl < minEl) orbitEl = minEl;
+            if (orbitEl > maxEl) orbitEl = maxEl;
+            const r = Math.max(1.0, orbitDist);
+            const ce = Math.cos(orbitEl); const se = Math.sin(orbitEl);
+            const sa = Math.sin(orbitAz); const ca = Math.cos(orbitAz);
+            const eye = [ r * ce * sa, r * se, r * ce * ca ];
+            viewMatrix = lookAt(eye, [0,0,0], [0,1,0]);
+        }
+        // Mouse orbit controls
+        (function initOrbitControls() {
+            let dragging = false; let lastX = 0; let lastY = 0;
+            canvas.addEventListener('mousedown', (e) => { if (e.button === 0) { dragging = true; lastX = e.clientX; lastY = e.clientY; } });
+            window.addEventListener('mouseup', () => { dragging = false; });
+            window.addEventListener('mousemove', (e) => {
+                if (!dragging) return;
+                const dx = e.clientX - lastX; const dy = e.clientY - lastY;
+                lastX = e.clientX; lastY = e.clientY;
+                const rotSpeed = 0.005;
+                orbitAz += dx * rotSpeed;
+                orbitEl += dy * rotSpeed; // inverted Y
+            });
+            canvas.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const zoomFactor = Math.exp(e.deltaY * 0.001);
+                orbitDist *= zoomFactor;
+                orbitDist = Math.min(Math.max(orbitDist, 10.0), 1e7);
+            }, { passive: false });
+        })();
 
         // ---- GPU Buffers (positions/velocities ping-pong) ----
         const particleCount = NUM_PARTICLES;
@@ -239,13 +290,14 @@
         // Fusion claims buffer (atomic flags) and params
         const claimsBuffer = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
         const zeroClaims = new Uint32Array(particleCount); // reused each frame to clear claims
-        const fusionParamsData = new Float32Array([FUSE_RADIUS, FUSE_MIN_REL_SPEED, fusionFactor, 0]);
+        // FusionParams: radius, minRelSpeed, fusionFactor, probability
+        const fusionParamsData = new Float32Array([FUSE_RADIUS, FUSE_MIN_REL_SPEED, fusionFactor, fusionProb]);
         const fusionParamsBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         function writeFusionParams() {
             fusionParamsData[0] = FUSE_RADIUS;
             fusionParamsData[1] = FUSE_MIN_REL_SPEED;
             fusionParamsData[2] = fusionFactor;
-            fusionParamsData[3] = 0.0;
+            fusionParamsData[3] = fusionProb;
             device.queue.writeBuffer(fusionParamsBuffer, 0, fusionParamsData.buffer, fusionParamsData.byteOffset, fusionParamsData.byteLength);
         }
         writeFusionParams();
@@ -463,59 +515,6 @@ fn main() {
                 { binding: 0, resource: { buffer: comBuffer } },
                 { binding: 1, resource: { buffer: smoothComBuffer } },
             ]
-        });
-
-        // New: recenter positions around current COM to avoid precision drift over long runs
-        const recenterWGSL = /* wgsl */`
-struct Vec4Buffer { data: array<vec4<f32>>, }
-struct Single { data: vec4<f32>, }
-struct SimParams {
-  dt: f32, G: f32, R: f32, spin: f32,
-  eps: f32, damping: f32, numParticlesF: f32, radiateCoeff: f32,
-}
-@group(0) @binding(0) var<storage, read_write> positions: Vec4Buffer;
-@group(0) @binding(1) var<storage, read> comIn: Single;
-@group(0) @binding(2) var<uniform> params: SimParams;
-@compute @workgroup_size(${WG_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i: u32 = gid.x;
-  let n: u32 = u32(params.numParticlesF);
-  if (i >= n) { return; }
-  let c = comIn.data.xyz;
-  let p4 = positions.data[i];
-  positions.data[i] = vec4<f32>(p4.xyz - c, p4.w);
-}
-`;
-        const recenterModule = device.createShaderModule({ code: recenterWGSL });
-        const recenterPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: recenterModule, entryPoint: 'main' } });
-        const recenterBG_posA = device.createBindGroup({
-            layout: recenterPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: posA } },
-                { binding: 1, resource: { buffer: smoothComBuffer } }, // use smoothed COM for consistent tracking
-                { binding: 2, resource: { buffer: simParamsBuffer } },
-            ]
-        });
-        const recenterBG_posB = device.createBindGroup({
-            layout: recenterPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: posB } },
-                { binding: 1, resource: { buffer: smoothComBuffer } },
-                { binding: 2, resource: { buffer: simParamsBuffer } },
-            ]
-        });
-        // New: zero the smoothed COM after recenter so rendering subtracts 0
-        const zeroSmoothWGSL = /* wgsl */`
-struct Single { data: vec4<f32>, }
-@group(0) @binding(0) var<storage, read_write> smoothOut: Single;
-@compute @workgroup_size(1)
-fn main() { smoothOut.data = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
-`;
-        const zeroSmoothModule = device.createShaderModule({ code: zeroSmoothWGSL });
-        const zeroSmoothPipeline = device.createComputePipeline({ layout: 'auto', compute: { module: zeroSmoothModule, entryPoint: 'main' } });
-        const zeroSmoothBG = device.createBindGroup({
-            layout: zeroSmoothPipeline.getBindGroupLayout(0),
-            entries: [ { binding: 0, resource: { buffer: smoothComBuffer } } ]
         });
 
         // ---- Shaders (WGSL) ----
@@ -804,6 +803,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
   if (canFuse && found && bestJ != i) {
     // Only lower index survives; avoid mutual merges and races
     if (i < bestJ) {
+      // Stochastic gating: skip with probability (1 - fusionProb)
+      let prob = fparams._pad; // field reassigned to probability
+      if (prob <= 0.0) { return; }
+      // Simple hash-based RNG per pair (i,bestJ) to avoid extra buffers
+      var h: u32 = (i * 73856093u) ^ (bestJ * 19349663u) ^ u32(params.numParticlesF);
+      h ^= h >> 17;
+      h *= 0xed5ad4bbu;
+      h ^= h >> 11;
+      h *= 0xac4c1b51u;
+      h ^= h >> 15;
+      h *= 0x31848babu;
+      h ^= h >> 14;
+      let rand01 = f32(h & 0x00FFFFFFu) / f32(0x01000000u);
+      if (rand01 > prob) { return; }
       let selfLock = atomicCompareExchangeWeak(&claims.data[i], 0u, 2u);
       if (selfLock.exchanged) {
         let jLock = atomicCompareExchangeWeak(&claims.data[bestJ], 0u, 1u);
@@ -1127,10 +1140,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             const frameStart = performance.now();
             // Match nbody2.html timing tweaks (kept as single-shot changes)
             if (loopCount === 10) { damping = 1.0; dampingSlider.value = damping.toFixed(2); dampingValueDisplay.textContent = damping.toFixed(2); writeSimParams(); }
-            if (loopCount === 150) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
+            if (loopCount === 300) { spin = 0.0; spinSlider.value = spin.toFixed(2); spinValueDisplay.textContent = spin.toFixed(2); writeSimParams(); }
 
             // Update matrices if size changed
             projMatrix = perspectiveMatrix(Math.PI / 4, canvas.width / canvas.height, 0.1, 1000000);
+            updateViewMatrix();
             writeMatrices();
 
             const encoder = device.createCommandEncoder();
@@ -1143,23 +1157,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
                ps0.setBindGroup(0, comSmoothBG);
                ps0.dispatchWorkgroups(1);
                ps0.end();
-
-               // Recenter positions around smoothed COM to reduce catastrophic cancellation when spread out
-               // and then zero the smoothed COM so downstream passes operate in the centered frame
-               {
-                 const wgCount = Math.ceil(particleCount / WG_SIZE);
-                 const pr = encoder.beginComputePass();
-                 pr.setPipeline(recenterPipeline);
-                 pr.setBindGroup(0, readFromA ? recenterBG_posA : recenterBG_posB);
-                 pr.dispatchWorkgroups(wgCount);
-                 pr.end();
-
-                 const pz = encoder.beginComputePass();
-                 pz.setPipeline(zeroSmoothPipeline);
-                 pz.setBindGroup(0, zeroSmoothBG);
-                 pz.dispatchWorkgroups(1);
-                 pz.end();
-               }
             }
 
             // Per-frame params
@@ -1229,28 +1226,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
               }
             }
 
-            // Recompute center of mass for rendering (using latest state)
-            {
-              const bg1 = localReadFromA ? comReduce1BG_A : comReduce1BG_B; // latest written buffer
-              const p1 = encoder.beginComputePass();
-              p1.setPipeline(comReduce1Pipeline);
-              p1.setBindGroup(0, bg1);
-              p1.dispatchWorkgroups(numComPartials);
-              p1.end();
-
-              const p2 = encoder.beginComputePass();
-              p2.setPipeline(comReduce2Pipeline);
-              p2.setBindGroup(0, comReduce2BG);
-              p2.dispatchWorkgroups(1);
-              p2.end();
-
-              // Smooth the COM once per frame for stable camera tracking
-              const ps = encoder.beginComputePass();
-              ps.setPipeline(comSmoothPipeline);
-              ps.setBindGroup(0, comSmoothBG);
-              ps.dispatchWorkgroups(1);
-              ps.end();
-            }
+            // Removed COM reduction & smoothing: rotation now about origin; no per-frame COM calculations
 
             // Render pass after last substep
             const colorView = context.getCurrentTexture().createView();
