@@ -620,11 +620,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             let invSoft = inverseSqrt(soft2);
             let dir = diff * invSoft;               // normalized direction
             let invSoft2 = invSoft * invSoft;       // 1/soft^2
-            let invSoft6 = invSoft2 * invSoft2 * invSoft2; // 1/soft^6
+            let invSoft4 = invSoft2 * invSoft2; // 1/soft^4 (changed from ^6
 
             // Acceleration magnitudes (depend only on mj)
             let a_attract = Gc * mj * invSoft2;
-            let a_repulse = (Rc * mj * invSoft6) * max(1.0, repulse_i);
+            let a_repulse = (Rc * mj * invSoft4) * max(1.0, repulse_i);
 
             // Radiative damping modeled as acceleration
             var a_radiate: f32 = 0.0;
@@ -768,13 +768,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
           let soft2 = d2 + eps2;
           let invSoft = inverseSqrt(soft2);
           let invSoft2 = invSoft * invSoft;
-          let invSoft6 = invSoft2 * invSoft2 * invSoft2;
+          let invSoft4 = invSoft2 * invSoft2; // 1/soft^4 (changed from ^6
           let Gc = params.G;
           let Rc = params.R;
 
           // Use mass-independent magnitudes for comparison (mi*mj cancels)
           let attractiveM = Gc * invSoft2;
-          let repulsiveM  = Rc * invSoft6;
+          let repulsiveM  = Rc * invSoft4;
 
           // Approaching if distance is shrinking: dp·(v_i - v_j) > 0
           let rel = v_i - tileVel[k].xyz;
