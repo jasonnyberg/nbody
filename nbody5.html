@@ -23,7 +23,9 @@
     <label>Restitution (alpha): <span id="restVal">0.50</span></label>
     <input id="rest" type="range" min="0.0" max="1.0" step="0.01" value="0.50" />
 
-    <label><input id="mergeToggle" type="checkbox" /> Enable permanent merge (debug)</label>
+    <!-- New: Radius factor slider -->
+    <label>Radius factor: <span id="rfVal">1</span></label>
+    <input id="rf" type="range" min="1" max="100" step="1" value="1" />
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
@@ -54,7 +56,7 @@
     let G = 0.30;
     let dt = 0.20;
     let restitution = 0.50; // used as alpha in energy restitution
-    let mergeEnabled = false; // disable permanent merge by default
+    let radiusFactor = 1.0; // new: scales collision radii
 
     const gEl = document.getElementById('g');
     const gVal = document.getElementById('gVal');
@@ -65,8 +67,11 @@
     const restEl = document.getElementById('rest');
     const restVal = document.getElementById('restVal');
     restEl.addEventListener('input', () => { restitution = parseFloat(restEl.value); restVal.textContent = restitution.toFixed(2); writeRest(); });
-    const mergeToggle = document.getElementById('mergeToggle');
-    mergeToggle.addEventListener('change', () => { mergeEnabled = mergeToggle.checked; });
+
+    // New: radius factor UI wiring
+    const rfEl = document.getElementById('rf');
+    const rfVal = document.getElementById('rfVal');
+    rfEl.addEventListener('input', () => { radiusFactor = parseFloat(rfEl.value); rfVal.textContent = String(rfEl.value); writeRadius(); });
 
     // Basic math helpers (column-major matrices like WebGPU expects)
     function perspective(fovy, aspect, near, far) {
@@ -116,7 +121,7 @@
     })();
 
     // Simulation setup (simple random sphere)
-    const particleCount = 2000; // keep moderate (O(N^2) pair find)
+    const particleCount = 50000; // keep moderate (O(N^2) pair find)
     const stride = 4; // vec4
     const stateBytes = particleCount * stride * 4;
 
@@ -163,6 +168,12 @@
     const restBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeRest(){ restParams[0]=restitution; device.queue.writeBuffer(restBuf, 0, restParams); }
     writeRest();
+
+    // New: collision radius factor uniform
+    const radiusParams = new Float32Array([radiusFactor, 0,0,0]);
+    const radiusBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRadius(){ radiusParams[0]=radiusFactor; device.queue.writeBuffer(radiusBuf, 0, radiusParams); }
+    writeRadius();
 
     // Matrices + viewport params in a 10-vec4 uniform for alignment
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
@@ -262,6 +273,7 @@ struct FloatBuf { data: array<f32>, }
 struct PairCount { value: atomic<u32>, }
 struct Pairs { data: array<vec4<u32>>, }
 struct FloatBuf1 { data: array<f32>, }
+struct Coll { rf: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
 @group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
 @group(0) @binding(1) var<storage, read> Pvel: Vec4Buf;
 @group(0) @binding(2) var<storage, read> M: FloatBuf;
@@ -269,6 +281,7 @@ struct FloatBuf1 { data: array<f32>, }
 @group(0) @binding(4) var<storage, read_write> pc: PairCount;
 @group(0) @binding(5) var<storage, read_write> pb: Pairs;
 @group(0) @binding(6) var<storage, read_write> PE: FloatBuf1; // per-pair ΔE
+@group(0) @binding(7) var<uniform> C: Coll;                  // collision radius factor
 
 const WG: u32 = 256u;
 var<workgroup> tPos: array<vec4<f32>, WG>;
@@ -323,8 +336,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
           if (mj > 0.0) {
             let dp = tPos[k].xyz - pi;
             let d2 = dot(dp, dp);
-            let ri = max(1.0, pow(mi, 0.3333));
-            let rj = max(1.0, pow(mj, 0.3333));
+            let rf = max(C.rf, 0.0);
+            let ri = rf * max(1.0, pow(mi, 0.3333));
+            let rj = rf * max(1.0, pow(mj, 0.3333));
             let R = ri + rj;
             if (d2 < R*R) {
               let relv = tVel[k].xyz - vi;
@@ -575,6 +589,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 4, resource: { buffer: pairCount } },
       { binding: 5, resource: { buffer: pairBuf } },
       { binding: 6, resource: { buffer: pairEnergy } },
+      { binding: 7, resource: { buffer: radiusBuf } },
     ]});
     const detectBG_posB = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posB } },
@@ -584,6 +599,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 4, resource: { buffer: pairCount } },
       { binding: 5, resource: { buffer: pairBuf } },
       { binding: 6, resource: { buffer: pairEnergy } },
+      { binding: 7, resource: { buffer: radiusBuf } },
     ]});
 
     const splitBG_velA = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
