@@ -20,10 +20,10 @@
     <label>dt: <span id="dtVal">0.20</span></label>
     <input id="dt" type="range" min="0.01" max="1.00" step="0.01" value="0.20" />
 
-    <label>Restitution: <span id="restVal">0.50</span></label>
+    <label>Restitution (alpha): <span id="restVal">0.50</span></label>
     <input id="rest" type="range" min="0.0" max="1.0" step="0.01" value="0.50" />
 
-    <label><input id="mergeToggle" type="checkbox" checked /> Enable merging</label>
+    <label><input id="mergeToggle" type="checkbox" /> Enable permanent merge (debug)</label>
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
@@ -53,8 +53,8 @@
     // Simple parameters/UI
     let G = 0.30;
     let dt = 0.20;
-    let restitution = 0.50;
-    let mergeEnabled = true;
+    let restitution = 0.50; // used as alpha in energy restitution
+    let mergeEnabled = false; // disable permanent merge by default
 
     const gEl = document.getElementById('g');
     const gVal = document.getElementById('gVal');
@@ -149,6 +149,8 @@
     const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    // new: per-pair energy buffer (ΔE at detection time)
+    const pairEnergy = device.createBuffer({ size: MAX_PAIRS * 4, usage: GPUBufferUsage.STORAGE });
 
     // Uniforms
     // SimParams is 4 floats (16 bytes): dt, G, eps, num
@@ -259,12 +261,14 @@ struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
 struct PairCount { value: atomic<u32>, }
 struct Pairs { data: array<vec4<u32>>, }
+struct FloatBuf1 { data: array<f32>, }
 @group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
 @group(0) @binding(1) var<storage, read> Pvel: Vec4Buf;
 @group(0) @binding(2) var<storage, read> M: FloatBuf;
 @group(0) @binding(3) var<uniform> S: SimParams;
 @group(0) @binding(4) var<storage, read_write> pc: PairCount;
 @group(0) @binding(5) var<storage, read_write> pb: Pairs;
+@group(0) @binding(6) var<storage, read_write> PE: FloatBuf1; // per-pair ΔE
 
 const WG: u32 = 256u;
 var<workgroup> tPos: array<vec4<f32>, WG>;
@@ -332,6 +336,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
                 let idx = atomicAdd(&pc.value, 1u);
                 if (idx < ${MAX_PAIRS}u) {
                   pb.data[idx] = vec4<u32>(i, j, packed.x, packed.y);
+                  // store bond energy ΔE from start-of-step velocities
+                  let dv = vi - tVel[k].xyz;
+                  let m12 = mi + mj;
+                  let dE = (mi * mj / (2.0 * m12)) * dot(dv, dv);
+                  PE.data[idx] = dE;
                 }
               }
             }
@@ -354,13 +363,17 @@ struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
 struct Rest { e: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
 struct Locks { data: array<atomic<u32>>, }
+struct Claims { data: array<atomic<u32>>, }
+struct FloatBuf1 { data: array<f32>, }
 
-@group(0) @binding(0) var<storage, read_write> V: Vec4Buf; // velocities
+@group(0) @binding(0) var<storage, read_write> V: Vec4Buf; // velocities (post-integration)
 @group(0) @binding(1) var<storage, read> M: FloatBuf;      // masses
 @group(0) @binding(2) var<storage, read_write> pc: PairCount; // pair count (atomic)
 @group(0) @binding(3) var<storage, read> pb: Pairs;        // pairs list
-@group(0) @binding(4) var<uniform> R: Rest;               // restitution
+@group(0) @binding(4) var<uniform> R: Rest;               // alpha (energy restitution)
 @group(0) @binding(5) var<storage, read_write> L: Locks;  // locks
+@group(0) @binding(6) var<storage, read_write> C: Claims; // claims per particle (to avoid multiple splits)
+@group(0) @binding(7) var<storage, read> PE: FloatBuf1;   // per-pair ΔE
 
 fn decodeNormal(packed: vec2<u32>) -> vec3<f32> {
   let xb = packed.x & 0xFFFFu;
@@ -375,7 +388,7 @@ fn decodeNormal(packed: vec2<u32>) -> vec3<f32> {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let k = gid.x;
   let total = atomicLoad(&pc.value);
   if (k >= total) { return; }
@@ -392,84 +405,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let lb = atomicCompareExchangeWeak(&L.data[b], 0u, 1u);
   if (!lb.exchanged) { atomicStore(&L.data[a], 0u); return; }
 
+  // Ensure each particle participates in at most one split per frame
+  let ca = atomicCompareExchangeWeak(&C.data[i], 0u, 1u);
+  if (!ca.exchanged) { atomicStore(&L.data[b], 0u); atomicStore(&L.data[a], 0u); return; }
+  let cb = atomicCompareExchangeWeak(&C.data[j], 0u, 1u);
+  if (!cb.exchanged) {
+    atomicStore(&C.data[i], 0u);
+    atomicStore(&L.data[b], 0u);
+    atomicStore(&L.data[a], 0u);
+    return;
+  }
+
   let mi = M.data[i];
   let mj = M.data[j];
   if (mi <= 0.0 || mj <= 0.0) {
+    // release
     atomicStore(&L.data[b], 0u);
     atomicStore(&L.data[a], 0u);
     return;
   }
 
-  var vi = V.data[i].xyz;
+  var vi = V.data[i].xyz; // post-integration velocities
   var vj = V.data[j].xyz;
   let n = decodeNormal(vec2<u32>(rec.z, rec.w));
-  let vrn = dot(vj - vi, n);
-  if (vrn >= 0.0) {
+
+  let m12 = mi + mj;
+  if (m12 <= 0.0) {
     atomicStore(&L.data[b], 0u);
     atomicStore(&L.data[a], 0u);
     return;
   }
+  let v12p = (mi * vi + mj * vj) / m12; // COM velocity after integration
 
-  let invMass = (1.0 / mi) + (1.0 / mj);
-  if (invMass <= 0.0) {
-    atomicStore(&L.data[b], 0u);
-    atomicStore(&L.data[a], 0u);
-    return;
+  // Energy to reintroduce along the bond normal
+  let alpha = clamp(R.e, 0.0, 1.0);
+  let dE = PE.data[k] * alpha;
+  let denom = (mi * mj) / m12; // reduced mass
+  if (denom > 0.0 && dE > 0.0) {
+    let u = sqrt(max(2.0 * dE / denom, 0.0));
+    // choose +u to ensure separation (v2' - v1') · n >= 0
+    vi = v12p - (mj / m12) * u * n;
+    vj = v12p + (mi / m12) * u * n;
+    V.data[i] = vec4<f32>(vi, 0.0);
+    V.data[j] = vec4<f32>(vj, 0.0);
   }
-
-  let J = -(1.0 + R.e) * vrn / invMass;
-  vi = vi - (J / mi) * n;
-  vj = vj + (J / mj) * n;
-
-  V.data[i] = vec4<f32>(vi, 0.0);
-  V.data[j] = vec4<f32>(vj, 0.0);
 
   // release locks
   atomicStore(&L.data[b], 0u);
   atomicStore(&L.data[a], 0u);
-}
-`;
-
-    const mergeWGSL = /* wgsl */`
-struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
-struct Vec4Buf { data: array<vec4<f32>>, }
-struct FloatBuf { data: array<f32>, }
-struct PairCount { value: atomic<u32>, }
-struct Pairs { data: array<vec4<u32>>, }
-struct Claims { data: array<atomic<u32>>, }
-@group(0) @binding(0) var<storage, read_write> Ppos: Vec4Buf;
-@group(0) @binding(1) var<storage, read_write> Pvel: Vec4Buf;
-@group(0) @binding(2) var<storage, read_write> M: FloatBuf;
-@group(0) @binding(4) var<storage, read_write> pc: PairCount; // must be read_write for atomic
-@group(0) @binding(5) var<storage, read> pb: Pairs;
-@group(0) @binding(6) var<storage, read_write> C: Claims;
-
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let k = gid.x;
-  let total = atomicLoad(&pc.value);
-  if (k >= total) { return; }
-  let rec = pb.data[k];
-  let i = rec.x; let j = rec.y;
-  if (i == j) { return; }
-  let a = min(i, j);
-  let b = max(i, j);
-  let ca = atomicCompareExchangeWeak(&C.data[a], 0u, 1u);
-  if (!ca.exchanged) { return; }
-  let cb = atomicCompareExchangeWeak(&C.data[b], 0u, 1u);
-  if (!cb.exchanged) { atomicStore(&C.data[a], 0u); return; }
-  let ma = M.data[a]; let mb = M.data[b];
-  if (ma <= 0.0 || mb <= 0.0) { atomicStore(&C.data[b], 0u); atomicStore(&C.data[a], 0u); return; }
-  let pA = Ppos.data[a].xyz; let pB = Ppos.data[b].xyz;
-  let vA = Pvel.data[a].xyz; let vB = Pvel.data[b].xyz;
-  let mNew = ma + mb;
-  let pNew = (pA * ma + pB * mb) / mNew;
-  let vNew = (vA * ma + vB * mb) / mNew;
-  Ppos.data[a] = vec4<f32>(pNew, 0.0);
-  Pvel.data[a] = vec4<f32>(vNew, 0.0);
-  M.data[a] = mNew;
-  M.data[b] = 0.0;
-  Pvel.data[b] = vec4<f32>(0.0);
 }
 `;
 
@@ -493,6 +476,15 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSO
   // Per-instance particle index
   let world = Ppos.data[iid].xyz;
   let mass = M.data[iid];
+
+  // Cull dead particles (mass <= 0)
+  if (mass <= 0.0) {
+    var out: VSOut;
+    out.pos = vec4<f32>(2.0, 2.0, 1.0, 1.0);
+    out.uv = vec2<f32>(2.0);
+    out.col = vec3<f32>(0.0);
+    return out;
+  }
 
   // Corner in NDC pixel space: (-1,-1), (-1,1), (1,-1), (1,1)
   var corner: vec2<f32>;
@@ -548,8 +540,6 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     const detectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectModule, entryPoint: 'main' } });
     const splitModule = device.createShaderModule({ code: splitWGSL });
     const splitPipe = device.createComputePipeline({ layout: 'auto', compute: { module: splitModule, entryPoint: 'main' } });
-    const mergeModule = device.createShaderModule({ code: mergeWGSL });
-    const mergePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mergeModule, entryPoint: 'main' } });
 
     const renderModule = device.createShaderModule({ code: renderWGSL });
     const renderPipe = device.createRenderPipeline({
@@ -584,6 +574,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 3, resource: { buffer: simParamsBuf } },
       { binding: 4, resource: { buffer: pairCount } },
       { binding: 5, resource: { buffer: pairBuf } },
+      { binding: 6, resource: { buffer: pairEnergy } },
     ]});
     const detectBG_posB = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posB } },
@@ -592,6 +583,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 3, resource: { buffer: simParamsBuf } },
       { binding: 4, resource: { buffer: pairCount } },
       { binding: 5, resource: { buffer: pairBuf } },
+      { binding: 6, resource: { buffer: pairEnergy } },
     ]});
 
     const splitBG_velA = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
@@ -601,6 +593,8 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 3, resource: { buffer: pairBuf } },
       { binding: 4, resource: { buffer: restBuf } },
       { binding: 5, resource: { buffer: locks } },
+      { binding: 6, resource: { buffer: claims } },
+      { binding: 7, resource: { buffer: pairEnergy } },
     ]});
     const splitBG_velB = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: velB } },
@@ -609,23 +603,8 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 3, resource: { buffer: pairBuf } },
       { binding: 4, resource: { buffer: restBuf } },
       { binding: 5, resource: { buffer: locks } },
-    ]});
-
-    const mergeBG_posA = device.createBindGroup({ layout: mergePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: velA } },
-      { binding: 2, resource: { buffer: masses } },
-      { binding: 4, resource: { buffer: pairCount } },
-      { binding: 5, resource: { buffer: pairBuf } },
       { binding: 6, resource: { buffer: claims } },
-    ]});
-    const mergeBG_posB = device.createBindGroup({ layout: mergePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: velB } },
-      { binding: 2, resource: { buffer: masses } },
-      { binding: 4, resource: { buffer: pairCount } },
-      { binding: 5, resource: { buffer: pairBuf } },
-      { binding: 6, resource: { buffer: claims } },
+      { binding: 7, resource: { buffer: pairEnergy } },
     ]});
 
     const renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
@@ -651,7 +630,21 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
 
       const enc = device.createCommandEncoder();
 
-      // Integrate
+      // Reset pair data and per-frame locks/claims
+      device.queue.writeBuffer(pairCount, 0, new Uint32Array([0]));
+      device.queue.writeBuffer(locks, 0, new Uint32Array(particleCount));
+      device.queue.writeBuffer(claims, 0, new Uint32Array(particleCount));
+
+      // 1) Detect pairs at start-of-step (pre-integration) and store ΔE, normals
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(detectPipe);
+        p.setBindGroup(0, readFromA ? detectBG_posA : detectBG_posB);
+        p.dispatchWorkgroups(Math.ceil(particleCount / 256));
+        p.end();
+      }
+
+      // 2) Integrate all particles
       {
         const p = enc.beginComputePass();
         p.setPipeline(integratePipe);
@@ -661,33 +654,12 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
         readFromA = !readFromA;
       }
 
-      // Detect pairs
-      device.queue.writeBuffer(pairCount, 0, new Uint32Array([0]));
-      device.queue.writeBuffer(locks, 0, new Uint32Array(particleCount));
-      device.queue.writeBuffer(claims, 0, new Uint32Array(particleCount));
-      {
-        const p = enc.beginComputePass();
-        p.setPipeline(detectPipe);
-        p.setBindGroup(0, readFromA ? detectBG_posA : detectBG_posB);
-        p.dispatchWorkgroups(Math.ceil(particleCount / 256));
-        p.end();
-      }
-
-      // Split impulse
+      // 3) Split: redistribute α·ΔE along bond normals to separate
       {
         const p = enc.beginComputePass();
         p.setPipeline(splitPipe);
         p.setBindGroup(0, readFromA ? splitBG_velA : splitBG_velB);
         // run enough workgroups to cover max pairs capacity, kernel early-outs by actual count
-        p.dispatchWorkgroups(Math.ceil(MAX_PAIRS / 256));
-        p.end();
-      }
-
-      // Merge (optional)
-      if (mergeEnabled) {
-        const p = enc.beginComputePass();
-        p.setPipeline(mergePipe);
-        p.setBindGroup(0, readFromA ? mergeBG_posA : mergeBG_posB);
         p.dispatchWorkgroups(Math.ceil(MAX_PAIRS / 256));
         p.end();
       }
