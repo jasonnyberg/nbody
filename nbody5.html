@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGPU N-Body (merge + split) – nbody5</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; }
+    #ui label { display:block; margin: 6px 0 2px; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="ui">
+    <div><b>Controls</b></div>
+    <label>G: <span id="gVal">0.30</span></label>
+    <input id="g" type="range" min="0.01" max="5.0" step="0.01" value="0.30" />
+
+    <label>dt: <span id="dtVal">0.20</span></label>
+    <input id="dt" type="range" min="0.01" max="1.00" step="0.01" value="0.20" />
+
+    <label>Restitution: <span id="restVal">0.50</span></label>
+    <input id="rest" type="range" min="0.0" max="1.0" step="0.01" value="0.50" />
+
+    <label><input id="mergeToggle" type="checkbox" checked /> Enable merging</label>
+
+    <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
+  </div>
+
+  <script>
+  "use strict";
+  (async () => {
+    const canvas = document.getElementById('c');
+    const statsDiv = document.getElementById('stats');
+    if (!('gpu' in navigator)) { alert('WebGPU not supported'); return; }
+
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }) || await navigator.gpu.requestAdapter();
+    if (!adapter) { alert('No GPU adapter'); return; }
+    const device = await adapter.requestDevice();
+    const context = canvas.getContext('webgpu');
+    const format = navigator.gpu.getPreferredCanvasFormat();
+
+    function resize() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      canvas.width = Math.floor(canvas.clientWidth * dpr);
+      canvas.height = Math.floor(canvas.clientHeight * dpr);
+      context.configure({ device, format, alphaMode: 'opaque' });
+    }
+    resize();
+    addEventListener('resize', resize);
+
+    // Simple parameters/UI
+    let G = 0.30;
+    let dt = 0.20;
+    let restitution = 0.50;
+    let mergeEnabled = true;
+
+    const gEl = document.getElementById('g');
+    const gVal = document.getElementById('gVal');
+    gEl.addEventListener('input', () => { G = parseFloat(gEl.value); gVal.textContent = G.toFixed(2); writeSimParams(); });
+    const dtEl = document.getElementById('dt');
+    const dtVal = document.getElementById('dtVal');
+    dtEl.addEventListener('input', () => { dt = parseFloat(dtEl.value); dtVal.textContent = dt.toFixed(2); writeSimParams(); });
+    const restEl = document.getElementById('rest');
+    const restVal = document.getElementById('restVal');
+    restEl.addEventListener('input', () => { restitution = parseFloat(restEl.value); restVal.textContent = restitution.toFixed(2); writeRest(); });
+    const mergeToggle = document.getElementById('mergeToggle');
+    mergeToggle.addEventListener('change', () => { mergeEnabled = mergeToggle.checked; });
+
+    // Basic math helpers (column-major matrices like WebGPU expects)
+    function perspective(fovy, aspect, near, far) {
+      const f = 1.0 / Math.tan(fovy / 2);
+      const nf = 1 / (near - far);
+      return new Float32Array([
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) * nf, -1,
+        0, 0, (2 * far * near) * nf, 0
+      ]);
+    }
+    function normalize(a) { const l = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/l, a[1]/l, a[2]/l]; }
+    function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+    function dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+    function lookAt(eye, center, up) {
+      const f = normalize([center[0]-eye[0], center[1]-eye[1], center[2]-eye[2]]);
+      const s = normalize(cross(f, up));
+      const u = cross(s, f);
+      return new Float32Array([
+        s[0], u[0], -f[0], 0,
+        s[1], u[1], -f[1], 0,
+        s[2], u[2], -f[2], 0,
+        - (s[0]*eye[0] + s[1]*eye[1] + s[2]*eye[2]),
+        - (u[0]*eye[0] + u[1]*eye[1] + u[2]*eye[2]),
+        (f[0]*eye[0] + f[1]*eye[1] + f[2]*eye[2]),
+        1
+      ]);
+    }
+
+    // Orbit camera (simple)
+    let az = 0.3, el = 0.6, dist = 2000.0;
+    function updateView() {
+      const ce = Math.cos(el), se = Math.sin(el), sa = Math.sin(az), ca = Math.cos(az);
+      const eye = [ dist * ce * sa, dist * se, dist * ce * ca ];
+      view = lookAt(eye, [0,0,0], [0,1,0]);
+    }
+    (function orbitControls(){
+      let drag=false, lx=0, ly=0;
+      canvas.addEventListener('mousedown', (e)=>{ if(e.button===0){ drag=true; lx=e.clientX; ly=e.clientY; }});
+      addEventListener('mouseup', ()=> drag=false);
+      addEventListener('mousemove', (e)=>{
+        if(!drag) return; const dx=e.clientX-lx, dy=e.clientY-ly; lx=e.clientX; ly=e.clientY;
+        az += dx * 0.005; el += dy * 0.005; el = Math.max(-1.55, Math.min(1.55, el));
+      });
+      canvas.addEventListener('wheel', (e)=>{ e.preventDefault(); dist *= Math.exp(e.deltaY * 0.001); dist = Math.max(10, Math.min(1e6, dist)); }, {passive:false});
+    })();
+
+    // Simulation setup (simple random sphere)
+    const particleCount = 2000; // keep moderate (O(N^2) pair find)
+    const stride = 4; // vec4
+    const stateBytes = particleCount * stride * 4;
+
+    function makeBuf(size, usage) { return device.createBuffer({ size, usage }); }
+    function bufFrom(arr, usage) {
+      const b = device.createBuffer({ size: arr.byteLength, usage, mappedAtCreation: true });
+      new Float32Array(b.getMappedRange()).set(arr);
+      b.unmap(); return b;
+    }
+
+    const posInit = new Float32Array(particleCount * stride);
+    const velInit = new Float32Array(particleCount * stride);
+    const massInit = new Float32Array(particleCount);
+    const rad = 800.0;
+    for (let i=0;i<particleCount;i++){
+      let x,y,z; do { x=(Math.random()*2-1)*rad; y=(Math.random()*2-1)*rad; z=(Math.random()*2-1)*rad; } while (x*x+y*y+z*z>rad*rad);
+      const o=i*stride; posInit[o]=x; posInit[o+1]=y; posInit[o+2]=z; posInit[o+3]=0;
+      velInit[o]=0; velInit[o+1]=0; velInit[o+2]=0; velInit[o+3]=0;
+      massInit[i]=1.0; // start uniform
+    }
+    let posA = bufFrom(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    let posB = makeBuf(stateBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    let velA = bufFrom(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+    let velB = makeBuf(stateBytes, GPUBufferUsage.STORAGE);
+    const masses = bufFrom(massInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+
+    // Collision pair buffers (very simple)
+    const MAX_PAIRS = Math.min(particleCount * 8, 262144);
+    const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE }); // vec4<u32>
+    const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+    // Uniforms
+    // SimParams is 4 floats (16 bytes): dt, G, eps, num
+    const simParams = new Float32Array([dt, G, 1.0, particleCount]); // eps defaults to 1.0
+    const simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeSimParams(){ device.queue.writeBuffer(simParamsBuf, 0, simParams.buffer, simParams.byteOffset, simParams.byteLength); }
+    writeSimParams();
+
+    const restParams = new Float32Array([restitution, 0,0,0]);
+    const restBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRest(){ restParams[0]=restitution; device.queue.writeBuffer(restBuf, 0, restParams); }
+    writeRest();
+
+    // Matrices + viewport params in a 10-vec4 uniform for alignment
+    let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
+    let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
+    const mats = new Float32Array(40); // 10 * vec4
+    const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeMats() {
+      proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
+      updateView();
+      mats.set(proj, 0);
+      mats.set(view, 16);
+      mats[32] = canvas.width;  // viewport W
+      mats[33] = canvas.height; // viewport H
+      mats[34] = 160.0;         // sprite sizeScale in pixels
+      mats[35] = Math.log(1.0 + 8.0); // normalization helper (not used strictly)
+      device.queue.writeBuffer(matsBuf, 0, mats);
+    }
+    writeMats();
+
+    // WGSL Shaders
+    const integrateWGSL = /* wgsl */`
+struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct FloatBuf { data: array<f32>, }
+@group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
+@group(0) @binding(1) var<storage, read> velIn: Vec4Buf;
+@group(0) @binding(2) var<storage, read_write> posOut: Vec4Buf;
+@group(0) @binding(3) var<storage, read_write> velOut: Vec4Buf;
+@group(0) @binding(4) var<uniform> P: SimParams;
+@group(0) @binding(5) var<storage, read> M: FloatBuf;
+
+const WG: u32 = 256u;
+var<workgroup> tPos: array<vec4<f32>, WG>;
+var<workgroup> tMass: array<f32, WG>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let i = gid.x;
+  let n = u32(P.numParticlesF);
+  if (i >= n) { return; }
+  let eps2 = P.eps * P.eps;
+  var p = posIn.data[i].xyz;
+  var v = velIn.data[i].xyz;
+  let mi = M.data[i];
+  if (mi <= 0.0) {
+    posOut.data[i] = posIn.data[i];
+    velOut.data[i] = velIn.data[i];
+    return;
+  }
+  var a = vec3<f32>(0.0);
+  var base: u32 = 0u;
+  loop {
+    if (base >= n) { break; }
+    let j = base + lid.x;
+    if (j < n) {
+      tPos[lid.x] = posIn.data[j];
+      tMass[lid.x] = M.data[j];
+    } else {
+      tPos[lid.x] = vec4<f32>(0.0);
+      tMass[lid.x] = 0.0;
+    }
+    workgroupBarrier();
+    let remain = n - base;
+    let count = select(WG, remain, remain < WG);
+    var k: u32 = 0u;
+    loop {
+      if (k >= count) { break; }
+      let m = tMass[k];
+      if (m > 0.0) {
+        let d = tPos[k].xyz - p;
+        let r2 = dot(d,d) + eps2;
+        let invR = inverseSqrt(r2);
+        let invR2 = invR * invR;
+        a += (P.G * m) * d * invR * invR2; // = G*m * d / r^3
+      }
+      k = k + 1u;
+    }
+    workgroupBarrier();
+    base = base + WG;
+  }
+  v = v + a * P.dt;
+  p = p + v * P.dt;
+  posOut.data[i] = vec4<f32>(p, 0.0);
+  velOut.data[i] = vec4<f32>(v, 0.0);
+}
+`;
+
+    const detectPairsWGSL = /* wgsl */`
+struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct FloatBuf { data: array<f32>, }
+struct PairCount { value: atomic<u32>, }
+struct Pairs { data: array<vec4<u32>>, }
+@group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
+@group(0) @binding(1) var<storage, read> Pvel: Vec4Buf;
+@group(0) @binding(2) var<storage, read> M: FloatBuf;
+@group(0) @binding(3) var<uniform> S: SimParams;
+@group(0) @binding(4) var<storage, read_write> pc: PairCount;
+@group(0) @binding(5) var<storage, read_write> pb: Pairs;
+
+const WG: u32 = 256u;
+var<workgroup> tPos: array<vec4<f32>, WG>;
+var<workgroup> tVel: array<vec4<f32>, WG>;
+var<workgroup> tMass: array<f32, WG>;
+
+fn encodeNormal(n: vec3<f32>) -> vec2<u32> {
+  let nx = clamp(n.x * 32767.0, -32767.0, 32767.0);
+  let ny = clamp(n.y * 32767.0, -32767.0, 32767.0);
+  let p0 = (u32(i32(nx) & 0xFFFF) | (u32(i32(ny) & 0xFFFF) << 16));
+  let p1 = select(0u, 1u, n.z < 0.0);
+  return vec2<u32>(p0, p1);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let i = gid.x;
+  let n = u32(S.numParticlesF);
+  if (i >= n) { return; }
+  var alive = true;
+  var mi = M.data[i];
+  if (mi <= 0.0) { alive = false; }
+  var pi = Ppos.data[i].xyz;
+  var vi = Pvel.data[i].xyz;
+
+  var base: u32 = 0u;
+  loop {
+    if (base >= n) { break; }
+    let jg = base + lid.x;
+    if (jg < n) {
+      tPos[lid.x] = Ppos.data[jg];
+      tVel[lid.x] = Pvel.data[jg];
+      tMass[lid.x] = M.data[jg];
+    } else {
+      tPos[lid.x] = vec4<f32>(0.0);
+      tVel[lid.x] = vec4<f32>(0.0);
+      tMass[lid.x] = 0.0;
+    }
+    workgroupBarrier();
+
+    let remain = n - base;
+    let count = select(WG, remain, remain < WG);
+    if (alive) {
+      var k: u32 = 0u;
+      loop {
+        if (k >= count) { break; }
+        let j = base + k;
+        if (j > i) {
+          let mj = tMass[k];
+          if (mj > 0.0) {
+            let dp = tPos[k].xyz - pi;
+            let d2 = dot(dp, dp);
+            let ri = max(1.0, pow(mi, 0.3333));
+            let rj = max(1.0, pow(mj, 0.3333));
+            let R = ri + rj;
+            if (d2 < R*R) {
+              let relv = tVel[k].xyz - vi;
+              if (dot(dp, relv) < 0.0) {
+                let len2 = max(d2, 1e-12);
+                let invL = inverseSqrt(len2);
+                let nhat = dp * invL;
+                let packed = encodeNormal(nhat);
+                let idx = atomicAdd(&pc.value, 1u);
+                if (idx < ${/* embed MAX_PAIRS literal */0}u + ${MAX_PAIRS}u) {
+                  pb.data[idx] = vec4<u32>(i, j, packed.x, packed.y);
+                }
+              }
+            }
+          }
+        }
+        k = k + 1u;
+      }
+    }
+
+    workgroupBarrier();
+    base = base + WG;
+  }
+}
+`;
+
+    const splitWGSL = /* wgsl */`
+struct FloatBuf { data: array<f32>, }
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct PairCount { value: atomic<u32>, }
+struct Pairs { data: array<vec4<u32>>, }
+struct Rest { alpha: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
+struct Locks { data: array<atomic<u32>>, }
+
+fn decodeNormal(p0: u32, p1: u32) -> vec3<f32> {
+  let sx = f32(i32(p0 & 0xFFFF));
+  let sy = f32(i32((p0 >> 16) & 0xFFFF));
+  var nx = sx / 32767.0;
+  var ny = sy / 32767.0;
+  let signZ = select(1.0, -1.0, (p1 & 1u) == 1u);
+  let zz = max(0.0, 1.0 - nx*nx - ny*ny);
+  var nz = sqrt(zz) * signZ;
+  let norm = max(length(vec3<f32>(nx,ny,nz)), 1e-6);
+  return vec3<f32>(nx,ny,nz) / norm;
+}
+
+@group(0) @binding(0) var<storage, read_write> V: Vec4Buf;
+@group(0) @binding(1) var<storage, read> M: FloatBuf;
+@group(0) @binding(2) var<storage, read_write> pc: PairCount;
+@group(0) @binding(3) var<storage, read> pb: Pairs;
+@group(0) @binding(4) var<uniform> rest: Rest;
+@group(0) @binding(5) var<storage, read_write> L: Locks;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let k = gid.x;
+  let total = atomicLoad(&pc.value);
+  if (k >= total) { return; }
+  let rec = pb.data[k];
+  let a = rec.x; let b = rec.y;
+  if (a == b) { return; }
+  let la = atomicCompareExchangeWeak(&L.data[a], 0u, 1u);
+  if (!la.exchanged) { return; }
+  let lb = atomicCompareExchangeWeak(&L.data[b], 0u, 1u);
+  if (!lb.exchanged) { atomicStore(&L.data[a], 0u); return; }
+  let m1 = M.data[a]; let m2 = M.data[b];
+  if (m1 <= 0.0 || m2 <= 0.0) { atomicStore(&L.data[b], 0u); atomicStore(&L.data[a], 0u); return; }
+  var v1 = V.data[a].xyz; var v2 = V.data[b].xyz;
+  let n = decodeNormal(rec.z, rec.w);
+  let rel = v2 - v1;
+  let relN = dot(rel, n);
+  if (relN >= 0.0) { atomicStore(&L.data[b], 0u); atomicStore(&L.data[a], 0u); return; }
+  let e = clamp(rest.alpha, 0.0, 1.0);
+  let invMass = (1.0 / max(m1, 1e-6)) + (1.0 / max(m2, 1e-6));
+  let J = -(1.0 + e) * relN / invMass;
+  v1 = v1 - (J / m1) * n;
+  v2 = v2 + (J / m2) * n;
+  V.data[a] = vec4<f32>(v1, 0.0);
+  V.data[b] = vec4<f32>(v2, 0.0);
+  atomicStore(&L.data[b], 0u); atomicStore(&L.data[a], 0u);
+}
+`;
+
+    const mergeWGSL = /* wgsl */`
+struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct FloatBuf { data: array<f32>, }
+struct PairCount { value: atomic<u32>, }
+struct Pairs { data: array<vec4<u32>>, }
+struct Claims { data: array<atomic<u32>>, }
+@group(0) @binding(0) var<storage, read_write> Ppos: Vec4Buf;
+@group(0) @binding(1) var<storage, read_write> Pvel: Vec4Buf;
+@group(0) @binding(2) var<storage, read_write> M: FloatBuf;
+@group(0) @binding(3) var<storage, read> S: SimParams;
+@group(0) @binding(4) var<storage, read> pc: PairCount;
+@group(0) @binding(5) var<storage, read> pb: Pairs;
+@group(0) @binding(6) var<storage, read_write> C: Claims;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (${/* merge toggle checked on CPU; we still create pipeline */''}false) { return; }
+  let k = gid.x;
+  let total = atomicLoad(&pc.value);
+  if (k >= total) { return; }
+  let rec = pb.data[k];
+  let i = rec.x; let j = rec.y;
+  if (i == j) { return; }
+  // Always choose lower index as survivor to keep it simple
+  let a = min(i, j);
+  let b = max(i, j);
+  // Try to claim both; if either already claimed, skip
+  let ca = atomicCompareExchangeWeak(&C.data[a], 0u, 1u);
+  if (!ca.exchanged) { return; }
+  let cb = atomicCompareExchangeWeak(&C.data[b], 0u, 1u);
+  if (!cb.exchanged) { atomicStore(&C.data[a], 0u); return; }
+
+  let ma = M.data[a]; let mb = M.data[b];
+  if (ma <= 0.0 || mb <= 0.0) { atomicStore(&C.data[b], 0u); atomicStore(&C.data[a], 0u); return; }
+  let pA = Ppos.data[a].xyz; let pB = Ppos.data[b].xyz;
+  let vA = Pvel.data[a].xyz; let vB = Pvel.data[b].xyz;
+  let mNew = ma + mb;
+  let pNew = (pA * ma + pB * mb) / mNew;
+  let vNew = (vA * ma + vB * mb) / mNew;
+  Ppos.data[a] = vec4<f32>(pNew, 0.0);
+  Pvel.data[a] = vec4<f32>(vNew, 0.0);
+  M.data[a] = mNew;
+  // consume b
+  M.data[b] = 0.0;
+  Pvel.data[b] = vec4<f32>(0.0);
+}
+`;
+
+    const renderWGSL = /* wgsl */`
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct FloatBuf { data: array<f32>, }
+struct Mats { m: array<vec4<f32>, 10>, }
+@group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
+@group(0) @binding(1) var<storage, read> M: FloatBuf;
+@group(0) @binding(2) var<uniform> U: Mats;
+
+struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) col: vec3<f32>, };
+
+fn loadMat(idx: u32) -> mat4x4<f32> {
+  let b = idx * 4u;
+  return mat4x4<f32>(U.m[b+0u], U.m[b+1u], U.m[b+2u], U.m[b+3u]);
+}
+
+fn corner(vid: u32) -> vec2<f32> {
+  switch(vid) {
+    case 0u: return vec2<f32>(-1.0, -1.0);
+    case 1u: return vec2<f32>(-1.0,  1.0);
+    case 2u: return vec2<f32>( 1.0, -1.0);
+    case 3u: return vec2<f32>(-1.0,  1.0);
+    case 4u: return vec2<f32>( 1.0,  1.0);
+    default: return vec2<f32>( 1.0, -1.0);
+  }
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
+  let proj = loadMat(0u);
+  let view = loadMat(1u);
+  let world = Ppos.data[iid].xyz;
+  let mass = M.data[iid];
+  let p = proj * (view * vec4<f32>(world, 1.0));
+  let vp = U.m[8u];
+  let sizePx = U.m[8u].z * (0.4 + log(1.0 + max(0.0, mass)) / ${Math.log(1+8)});
+  let uv = corner(vid);
+  let ndcOffset = uv * sizePx * 2.0 / vec2<f32>(vp.x, vp.y);
+  let offsetClip = vec4<f32>(ndcOffset * p.w, 0.0, 0.0);
+  var out: VSOut;
+  out.pos = p + offsetClip;
+  let t = clamp(mass / 8.0, 0.0, 1.0);
+  out.col = mix(vec3<f32>(0.2,0.6,1.0), vec3<f32>(1.0,0.8,0.2), t);
+  return out;
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(in.col, 1.0);
+}
+`;
+
+    // Pipelines
+    const integrateModule = device.createShaderModule({ code: integrateWGSL });
+    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
+    const detectModule = device.createShaderModule({ code: detectPairsWGSL });
+    const detectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectModule, entryPoint: 'main' } });
+    const splitModule = device.createShaderModule({ code: splitWGSL });
+    const splitPipe = device.createComputePipeline({ layout: 'auto', compute: { module: splitModule, entryPoint: 'main' } });
+    const mergeModule = device.createShaderModule({ code: mergeWGSL });
+    const mergePipe = device.createComputePipeline({ layout: 'auto', compute: { module: mergeModule, entryPoint: 'main' } });
+
+    const renderModule = device.createShaderModule({ code: renderWGSL });
+    const renderPipe = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: renderModule, entryPoint: 'vs' },
+      fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' }
+    });
+
+    // Bind groups (ping-pong variants)
+    const integrateBG_AtoB = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: velA } },
+      { binding: 2, resource: { buffer: posB } },
+      { binding: 3, resource: { buffer: velB } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+    ]});
+    const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: velB } },
+      { binding: 2, resource: { buffer: posA } },
+      { binding: 3, resource: { buffer: velA } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+    ]});
+
+    const detectBG_posA = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: velA } },
+      { binding: 2, resource: { buffer: masses } },
+      { binding: 3, resource: { buffer: simParamsBuf } },
+      { binding: 4, resource: { buffer: pairCount } },
+      { binding: 5, resource: { buffer: pairBuf } },
+    ]});
+    const detectBG_posB = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: velB } },
+      { binding: 2, resource: { buffer: masses } },
+      { binding: 3, resource: { buffer: simParamsBuf } },
+      { binding: 4, resource: { buffer: pairCount } },
+      { binding: 5, resource: { buffer: pairBuf } },
+    ]});
+
+    const splitBG_velA = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: velA } },
+      { binding: 1, resource: { buffer: masses } },
+      { binding: 2, resource: { buffer: pairCount } },
+      { binding: 3, resource: { buffer: pairBuf } },
+      { binding: 4, resource: { buffer: restBuf } },
+      { binding: 5, resource: { buffer: locks } },
+    ]});
+    const splitBG_velB = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: velB } },
+      { binding: 1, resource: { buffer: masses } },
+      { binding: 2, resource: { buffer: pairCount } },
+      { binding: 3, resource: { buffer: pairBuf } },
+      { binding: 4, resource: { buffer: restBuf } },
+      { binding: 5, resource: { buffer: locks } },
+    ]});
+
+    const mergeBG_posA = device.createBindGroup({ layout: mergePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: velA } },
+      { binding: 2, resource: { buffer: masses } },
+      { binding: 3, resource: { buffer: simParamsBuf } },
+      { binding: 4, resource: { buffer: pairCount } },
+      { binding: 5, resource: { buffer: pairBuf } },
+      { binding: 6, resource: { buffer: claims } },
+    ]});
+    const mergeBG_posB = device.createBindGroup({ layout: mergePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: velB } },
+      { binding: 2, resource: { buffer: masses } },
+      { binding: 3, resource: { buffer: simParamsBuf } },
+      { binding: 4, resource: { buffer: pairCount } },
+      { binding: 5, resource: { buffer: pairBuf } },
+      { binding: 6, resource: { buffer: claims } },
+    ]});
+
+    const renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: masses } },
+      { binding: 2, resource: { buffer: matsBuf } },
+    ]});
+    const renderBG_posB = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: masses } },
+      { binding: 2, resource: { buffer: matsBuf } },
+    ]});
+
+    // Frame loop
+    let readFromA = true;
+    let lastT = performance.now();
+    function frame() {
+      const now = performance.now();
+      const dtMs = now - lastT; lastT = now;
+      writeMats();
+      simParams[0] = dt; simParams[1] = G; simParams[2] = 1.0; simParams[3] = particleCount; // eps = 1.0
+      writeSimParams();
+
+      const enc = device.createCommandEncoder();
+
+      // Integrate
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(integratePipe);
+        p.setBindGroup(0, readFromA ? integrateBG_AtoB : integrateBG_BtoA);
+        p.dispatchWorkgroups(Math.ceil(particleCount / 256));
+        p.end();
+        readFromA = !readFromA;
+      }
+
+      // Detect pairs
+      device.queue.writeBuffer(pairCount, 0, new Uint32Array([0]));
+      device.queue.writeBuffer(locks, 0, new Uint32Array(particleCount));
+      device.queue.writeBuffer(claims, 0, new Uint32Array(particleCount));
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(detectPipe);
+        p.setBindGroup(0, readFromA ? detectBG_posA : detectBG_posB);
+        p.dispatchWorkgroups(Math.ceil(particleCount / 256));
+        p.end();
+      }
+
+      // Split impulse
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(splitPipe);
+        p.setBindGroup(0, readFromA ? splitBG_velA : splitBG_velB);
+        // run enough workgroups to cover max pairs capacity, kernel early-outs by actual count
+        p.dispatchWorkgroups(Math.ceil(MAX_PAIRS / 256));
+        p.end();
+      }
+
+      // Merge (optional)
+      if (mergeEnabled) {
+        const p = enc.beginComputePass();
+        p.setPipeline(mergePipe);
+        p.setBindGroup(0, readFromA ? mergeBG_posA : mergeBG_posB);
+        p.dispatchWorkgroups(Math.ceil(MAX_PAIRS / 256));
+        p.end();
+      }
+
+      // Render
+      {
+        const viewTex = context.getCurrentTexture().createView();
+        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
+        rp.setPipeline(renderPipe);
+        rp.setBindGroup(0, readFromA ? renderBG_posA : renderBG_posB);
+        rp.draw(6, particleCount);
+        rp.end();
+      }
+
+      device.queue.submit([enc.finish()]);
+
+      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
