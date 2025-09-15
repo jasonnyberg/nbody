@@ -35,8 +35,8 @@
     <label>Spin: <span id="spinVal">0.00</span></label>
     <input id="spin" type="range" min="-2.0" max="2.0" step="0.01" value="0.00" />
 
-    <label>Damping: <span id="dampVal">0.00</span></label>
-    <input id="damp" type="range" min="0.0" max="1.0" step="0.001" value="0.00" />
+    <label>Damping: <span id="dampVal">1.00</span></label>
+    <input id="damp" type="range" min="0.0" max="1.0" step="0.001" value="1.00" />
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
@@ -70,7 +70,7 @@
     let radiusFactor = 2.0; // new: scales collision radii
     let R = 10.0;           // new: short-range repulsion strength (like nbody3)
     let spin = 0.00;        // new: tangential velocity injection rate (rad/s)
-    let damping = 0.00;     // new: velocity damping coefficient (1/s)
+    let damping = 1.00;     // CHANGED: damping factor (0..1), applied directly to velocity (1.0 = no damping)
 
     const gEl = document.getElementById('g');
     const gVal = document.getElementById('gVal');
@@ -246,7 +246,7 @@
 struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
-struct Damp { g: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
+struct Damp { factor: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
 struct Repulse { k: f32, _r0: f32, _r1: f32, _r2: f32 }
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
 @group(0) @binding(1) var<storage, read> velIn: Vec4Buf;
@@ -315,9 +315,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
   }
   if (isActive) {
     v = v + a * P.dt;
-    // apply exponential damping
-    let damp = exp(-D.g * P.dt);
-    v = v * damp;
+    // apply multiplicative damping like nbody3 (direct factor 0..1)
+    v = v * D.factor;
     p = p + v * P.dt;
     posOut.data[i] = vec4<f32>(p, 0.0);
     velOut.data[i] = vec4<f32>(v, 0.0);
