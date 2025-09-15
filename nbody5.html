@@ -38,6 +38,10 @@
     <label>Damping: <span id="dampVal">1.00</span></label>
     <input id="damp" type="range" min="0.0" max="1.0" step="0.001" value="1.00" />
 
+    <!-- New: Radiative damping -->
+    <label>Radiative: <span id="radVal">0.005</span></label>
+    <input id="rad" type="range" min="0.0" max="0.1" step="0.001" value="0.005" />
+
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
 
@@ -71,6 +75,7 @@
     let R = 10.0;           // new: short-range repulsion strength (like nbody3)
     let spin = 0.00;        // new: tangential velocity injection rate (rad/s)
     let damping = 1.00;     // CHANGED: damping factor (0..1), applied directly to velocity (1.0 = no damping)
+    let radiativeDamping = 0.005; // new: radiative damping coefficient
 
     const gEl = document.getElementById('g');
     const gVal = document.getElementById('gVal');
@@ -99,6 +104,11 @@
     const dampEl = document.getElementById('damp');
     const dampVal = document.getElementById('dampVal');
     dampEl.addEventListener('input', () => { damping = parseFloat(dampEl.value); dampVal.textContent = damping.toFixed(3); writeDamp(); });
+
+    // New: radiative damping UI wiring
+    const radEl = document.getElementById('rad');
+    const radVal = document.getElementById('radVal');
+    radEl.addEventListener('input', () => { radiativeDamping = parseFloat(radEl.value); radVal.textContent = radiativeDamping.toFixed(3); writeRad(); });
 
     // Basic math helpers (column-major matrices like WebGPU expects)
     function perspective(fovy, aspect, near, far) {
@@ -223,6 +233,12 @@
     function writeRepulse(){ repulseParams[0]=R; device.queue.writeBuffer(repulseBuf, 0, repulseParams); }
     writeRepulse();
 
+    // New: radiative damping uniform
+    const radParams = new Float32Array([radiativeDamping, 0,0,0]);
+    const radBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRad(){ radParams[0]=radiativeDamping; device.queue.writeBuffer(radBuf, 0, radParams); }
+    writeRad();
+
     // Matrices + viewport params in a 10-vec4 uniform for alignment
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
     let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
@@ -248,6 +264,7 @@ struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
 struct Damp { factor: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
 struct Repulse { k: f32, _r0: f32, _r1: f32, _r2: f32 }
+struct Rad { c: f32, _r0: f32, _r1: f32, _r2: f32 } // new radiative coefficient
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
 @group(0) @binding(1) var<storage, read> velIn: Vec4Buf;
 @group(0) @binding(2) var<storage, read_write> posOut: Vec4Buf;
@@ -256,9 +273,11 @@ struct Repulse { k: f32, _r0: f32, _r1: f32, _r2: f32 }
 @group(0) @binding(5) var<storage, read> M: FloatBuf;
 @group(0) @binding(6) var<uniform> D: Damp;
 @group(0) @binding(7) var<uniform> Rp: Repulse; // new repulsion coefficient
+@group(0) @binding(8) var<uniform> Rd: Rad;     // new radiative damping
 
 const WG: u32 = 256u;
 var<workgroup> tPos: array<vec4<f32>, WG>;
+var<workgroup> tVel: array<vec4<f32>, WG>;   // new: neighbor velocities
 var<workgroup> tMass: array<f32, WG>;
 
 @compute @workgroup_size(256)
@@ -282,9 +301,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     let j = base + lid.x;
     if (j < n) {
       tPos[lid.x] = posIn.data[j];
+      tVel[lid.x] = velIn.data[j]; // load neighbor velocity
       tMass[lid.x] = M.data[j];
     } else {
       tPos[lid.x] = vec4<f32>(0.0);
+      tVel[lid.x] = vec4<f32>(0.0);
       tMass[lid.x] = 0.0;
     }
     workgroupBarrier();
@@ -304,7 +325,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
           let invR4 = invR2 * invR2;
           let dir = d * invR;
           // gravity (1/r^2) minus short-range repulsion (1/r^4)
-          let aMag = (P.G * m) * invR2 - (Rp.k * m) * invR4;
+          let aG = (P.G * m) * invR2;
+          let aR = (Rp.k * m) * invR4;
+          var aRad: f32 = 0.0;
+          // Apply radiative damping when repulsion ~ attraction (gate: aR >= aG)
+          if (aR >= aG) {
+            let vj = tVel[k].xyz;
+            let closingSpeed = dot(d, v - vj);
+            aRad = Rd.c * closingSpeed * invR; // acceleration magnitude along dir
+          }
+          let aMag = aG - aR - aRad;
           a = a + dir * aMag;
         }
         k = k + 1u;
@@ -667,6 +697,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 5, resource: { buffer: masses } },
       { binding: 6, resource: { buffer: dampBuf } },
       { binding: 7, resource: { buffer: repulseBuf } }, // new
+      { binding: 8, resource: { buffer: radBuf } },     // new radiative
     ]});
     const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posB } },
@@ -677,6 +708,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 5, resource: { buffer: masses } },
       { binding: 6, resource: { buffer: dampBuf } },
       { binding: 7, resource: { buffer: repulseBuf } }, // new
+      { binding: 8, resource: { buffer: radBuf } },     // new radiative
     ]});
 
     const detectBG_posA = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
@@ -755,6 +787,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       simParams[0] = dt; simParams[1] = G; simParams[2] = 1.0; simParams[3] = particleCount; // eps = 1.0
       writeSimParams();
       writeRepulse(); // ensure R updates
+      writeRad();     // ensure radiative damping updates
 
       // Force spin = 1.0 for first 10 frames, then use UI-controlled value
       if (frameCount < 10) {
