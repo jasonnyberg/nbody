@@ -20,12 +20,23 @@
     <label>dt: <span id="dtVal">0.20</span></label>
     <input id="dt" type="range" min="0.01" max="1.00" step="0.01" value="0.20" />
 
-    <label>Restitution (alpha): <span id="restVal">0.50</span></label>
-    <input id="rest" type="range" min="0.0" max="1.0" step="0.01" value="0.50" />
+    <label>Restitution (alpha): <span id="restVal">1.00</span></label>
+    <input id="rest" type="range" min="0.0" max="1.0" step="0.01" value="1.00" />
 
     <!-- New: Radius factor slider -->
-    <label>Radius factor: <span id="rfVal">1</span></label>
-    <input id="rf" type="range" min="1" max="100" step="1" value="1" />
+    <label>Radius factor: <span id="rfVal">2</span></label>
+    <input id="rf" type="range" min="1" max="100" step="1" value="2" />
+
+    <!-- New: Repulsion (R) slider -->
+    <label>Repulsion R: <span id="repVal">10</span></label>
+    <input id="rep" type="range" min="0" max="100" step="1" value="10" />
+
+    <!-- New: Spin and Damping sliders -->
+    <label>Spin: <span id="spinVal">0.00</span></label>
+    <input id="spin" type="range" min="-2.0" max="2.0" step="0.01" value="0.00" />
+
+    <label>Damping: <span id="dampVal">0.00</span></label>
+    <input id="damp" type="range" min="0.0" max="1.0" step="0.001" value="0.00" />
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
@@ -55,8 +66,11 @@
     // Simple parameters/UI
     let G = 0.30;
     let dt = 0.20;
-    let restitution = 0.50; // used as alpha in energy restitution
-    let radiusFactor = 1.0; // new: scales collision radii
+    let restitution = 1.00; // used as alpha in energy restitution
+    let radiusFactor = 2.0; // new: scales collision radii
+    let R = 10.0;           // new: short-range repulsion strength (like nbody3)
+    let spin = 0.00;        // new: tangential velocity injection rate (rad/s)
+    let damping = 0.00;     // new: velocity damping coefficient (1/s)
 
     const gEl = document.getElementById('g');
     const gVal = document.getElementById('gVal');
@@ -72,6 +86,19 @@
     const rfEl = document.getElementById('rf');
     const rfVal = document.getElementById('rfVal');
     rfEl.addEventListener('input', () => { radiusFactor = parseFloat(rfEl.value); rfVal.textContent = String(rfEl.value); writeRadius(); });
+
+    // New: repulsion UI wiring
+    const repEl = document.getElementById('rep');
+    const repVal = document.getElementById('repVal');
+    repEl.addEventListener('input', () => { R = parseFloat(repEl.value); repVal.textContent = String(repEl.value); writeRepulse(); });
+
+    // New: spin + damping UI wiring
+    const spinEl = document.getElementById('spin');
+    const spinVal = document.getElementById('spinVal');
+    spinEl.addEventListener('input', () => { spin = parseFloat(spinEl.value); spinVal.textContent = spin.toFixed(2); writeSpin(); });
+    const dampEl = document.getElementById('damp');
+    const dampVal = document.getElementById('dampVal');
+    dampEl.addEventListener('input', () => { damping = parseFloat(dampEl.value); dampVal.textContent = damping.toFixed(3); writeDamp(); });
 
     // Basic math helpers (column-major matrices like WebGPU expects)
     function perspective(fovy, aspect, near, far) {
@@ -115,13 +142,16 @@
       addEventListener('mouseup', ()=> drag=false);
       addEventListener('mousemove', (e)=>{
         if(!drag) return; const dx=e.clientX-lx, dy=e.clientY-ly; lx=e.clientX; ly=e.clientY;
-        az += dx * 0.005; el += dy * 0.005; el = Math.max(-1.55, Math.min(1.55, el));
+        az += dx * 0.005; el += dy * 0.005;
+        const minEl = -Math.PI/2 + 0.01;
+        const maxEl =  Math.PI/2 - 0.01;
+        el = Math.max(minEl, Math.min(maxEl, el));
       });
       canvas.addEventListener('wheel', (e)=>{ e.preventDefault(); dist *= Math.exp(e.deltaY * 0.001); dist = Math.max(10, Math.min(1e6, dist)); }, {passive:false});
     })();
 
     // Simulation setup (simple random sphere)
-    const particleCount = 50000; // keep moderate (O(N^2) pair find)
+    const particleCount = 20000; // keep moderate (O(N^2) pair find)
     const stride = 4; // vec4
     const stateBytes = particleCount * stride * 4;
 
@@ -175,6 +205,24 @@
     function writeRadius(){ radiusParams[0]=radiusFactor; device.queue.writeBuffer(radiusBuf, 0, radiusParams); }
     writeRadius();
 
+    // New: damping uniform
+    const dampParams = new Float32Array([damping, 0,0,0]);
+    const dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeDamp(){ dampParams[0]=damping; device.queue.writeBuffer(dampBuf, 0, dampParams); }
+    writeDamp();
+
+    // New: spin uniform
+    const spinParams = new Float32Array([spin, 0,0,0]);
+    const spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeSpin(){ spinParams[0]=spin; device.queue.writeBuffer(spinBuf, 0, spinParams); }
+    writeSpin();
+
+    // New: repulsion (R) uniform
+    const repulseParams = new Float32Array([R, 0,0,0]);
+    const repulseBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRepulse(){ repulseParams[0]=R; device.queue.writeBuffer(repulseBuf, 0, repulseParams); }
+    writeRepulse();
+
     // Matrices + viewport params in a 10-vec4 uniform for alignment
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
     let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
@@ -198,12 +246,16 @@
 struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
+struct Damp { g: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
+struct Repulse { k: f32, _r0: f32, _r1: f32, _r2: f32 }
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
 @group(0) @binding(1) var<storage, read> velIn: Vec4Buf;
 @group(0) @binding(2) var<storage, read_write> posOut: Vec4Buf;
 @group(0) @binding(3) var<storage, read_write> velOut: Vec4Buf;
 @group(0) @binding(4) var<uniform> P: SimParams;
 @group(0) @binding(5) var<storage, read> M: FloatBuf;
+@group(0) @binding(6) var<uniform> D: Damp;
+@group(0) @binding(7) var<uniform> Rp: Repulse; // new repulsion coefficient
 
 const WG: u32 = 256u;
 var<workgroup> tPos: array<vec4<f32>, WG>;
@@ -249,7 +301,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
           let r2 = dot(d,d) + eps2;
           let invR = inverseSqrt(r2);
           let invR2 = invR * invR;
-          a = a + (P.G * m) * d * invR * invR2; // = G*m * d / r^3
+          let invR4 = invR2 * invR2;
+          let dir = d * invR;
+          // gravity (1/r^2) minus short-range repulsion (1/r^4)
+          let aMag = (P.G * m) * invR2 - (Rp.k * m) * invR4;
+          a = a + dir * aMag;
         }
         k = k + 1u;
       }
@@ -259,6 +315,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
   }
   if (isActive) {
     v = v + a * P.dt;
+    // apply exponential damping
+    let damp = exp(-D.g * P.dt);
+    v = v * damp;
     p = p + v * P.dt;
     posOut.data[i] = vec4<f32>(p, 0.0);
     velOut.data[i] = vec4<f32>(v, 0.0);
@@ -378,7 +437,6 @@ struct FloatBuf { data: array<f32>, }
 struct Rest { e: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
 struct Locks { data: array<atomic<u32>>, }
 struct Claims { data: array<atomic<u32>>, }
-struct FloatBuf1 { data: array<f32>, }
 
 @group(0) @binding(0) var<storage, read_write> V: Vec4Buf; // velocities (post-integration)
 @group(0) @binding(1) var<storage, read> M: FloatBuf;      // masses
@@ -387,7 +445,6 @@ struct FloatBuf1 { data: array<f32>, }
 @group(0) @binding(4) var<uniform> R: Rest;               // alpha (energy restitution)
 @group(0) @binding(5) var<storage, read_write> L: Locks;  // locks
 @group(0) @binding(6) var<storage, read_write> C: Claims; // claims per particle (to avoid multiple splits)
-@group(0) @binding(7) var<storage, read> PE: FloatBuf1;   // per-pair ΔE
 
 fn decodeNormal(packed: vec2<u32>) -> vec3<f32> {
   let xb = packed.x & 0xFFFFu;
@@ -402,7 +459,7 @@ fn decodeNormal(packed: vec2<u32>) -> vec3<f32> {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let k = gid.x;
   let total = atomicLoad(&pc.value);
   if (k >= total) { return; }
@@ -451,22 +508,57 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
   }
   let v12p = (mi * vi + mj * vj) / m12; // COM velocity after integration
 
-  // Energy to reintroduce along the bond normal
-  let alpha = clamp(R.e, 0.0, 1.0);
-  let dE = PE.data[k] * alpha;
-  let denom = (mi * mj) / m12; // reduced mass
-  if (denom > 0.0 && dE > 0.0) {
-    let u = sqrt(max(2.0 * dE / denom, 0.0));
-    // choose +u to ensure separation (v2' - v1') · n >= 0
-    vi = v12p - (mj / m12) * u * n;
-    vj = v12p + (mi / m12) * u * n;
-    V.data[i] = vec4<f32>(vi, 0.0);
-    V.data[j] = vec4<f32>(vj, 0.0);
-  }
+  // Angular-momentum-preserving split: keep tangential component, reverse normal component (with restitution)
+  let alpha = clamp(R.e, 0.0, 1.0);           // coefficient of restitution along normal
+  let vrel = vj - vi;                         // relative velocity after integration
+  let vn_mag = dot(vrel, n);                  // normal component magnitude
+  let vn = vn_mag * n;                        // normal component vector
+  let vt = vrel - vn;                         // tangential component
+  // Only flip normal if approaching (vn_mag < 0). Otherwise keep it (already separating)
+  let vn_mag_new = select(vn_mag, -alpha * vn_mag, vn_mag < 0.0);
+  let vrel_new = vt + vn_mag_new * n;
+
+  // Reconstruct individual velocities from COM and relative velocity
+  vi = v12p - (mj / m12) * vrel_new;
+  vj = v12p + (mi / m12) * vrel_new;
+  V.data[i] = vec4<f32>(vi, 0.0);
+  V.data[j] = vec4<f32>(vj, 0.0);
 
   // release locks
   atomicStore(&L.data[b], 0u);
   atomicStore(&L.data[a], 0u);
+}
+`;
+
+    // New: spin injection shader
+    const spinWGSL = /* wgsl */`
+struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct Spin { w: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
+@group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
+@group(0) @binding(1) var<storage, read_write> V: Vec4Buf;
+@group(0) @binding(2) var<uniform> P: SimParams;
+@group(0) @binding(3) var<uniform> S: Spin;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x;
+  let n = u32(P.numParticlesF);
+  if (i >= n) { return; }
+  let w = S.w;
+  if (abs(w) <= 0.0) { return; }
+  let p = Ppos.data[i].xyz;
+  var v = V.data[i].xyz;
+  // Match nbody3: spin around Y axis (tangent in XZ plane), normalized in XZ
+  let posXZ = p.xz;
+  let len2 = dot(posXZ, posXZ);
+  if (len2 > 0.0) {
+    let invLen = inverseSqrt(len2);
+    let tang2 = vec2<f32>(-posXZ.y, posXZ.x) * invLen;
+    let tang = vec3<f32>(tang2.x, 0.0, tang2.y);
+    v = v + (w * P.dt) * tang;
+  }
+  V.data[i] = vec4<f32>(v, 0.0);
 }
 `;
 
@@ -554,6 +646,9 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
     const detectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectModule, entryPoint: 'main' } });
     const splitModule = device.createShaderModule({ code: splitWGSL });
     const splitPipe = device.createComputePipeline({ layout: 'auto', compute: { module: splitModule, entryPoint: 'main' } });
+    // New: spin pipeline
+    const spinModule = device.createShaderModule({ code: spinWGSL });
+    const spinPipe = device.createComputePipeline({ layout: 'auto', compute: { module: spinModule, entryPoint: 'main' } });
 
     const renderModule = device.createShaderModule({ code: renderWGSL });
     const renderPipe = device.createRenderPipeline({
@@ -571,6 +666,8 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 3, resource: { buffer: velB } },
       { binding: 4, resource: { buffer: simParamsBuf } },
       { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+      { binding: 7, resource: { buffer: repulseBuf } }, // new
     ]});
     const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posB } },
@@ -579,6 +676,8 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 3, resource: { buffer: velA } },
       { binding: 4, resource: { buffer: simParamsBuf } },
       { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+      { binding: 7, resource: { buffer: repulseBuf } }, // new
     ]});
 
     const detectBG_posA = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
@@ -610,7 +709,6 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 4, resource: { buffer: restBuf } },
       { binding: 5, resource: { buffer: locks } },
       { binding: 6, resource: { buffer: claims } },
-      { binding: 7, resource: { buffer: pairEnergy } },
     ]});
     const splitBG_velB = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: velB } },
@@ -620,7 +718,6 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 4, resource: { buffer: restBuf } },
       { binding: 5, resource: { buffer: locks } },
       { binding: 6, resource: { buffer: claims } },
-      { binding: 7, resource: { buffer: pairEnergy } },
     ]});
 
     const renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
@@ -634,15 +731,39 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       { binding: 2, resource: { buffer: matsBuf } },
     ]});
 
+    // New: spin bind groups
+    const spinBG_posA = device.createBindGroup({ layout: spinPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: velA } },
+      { binding: 2, resource: { buffer: simParamsBuf } },
+      { binding: 3, resource: { buffer: spinBuf } },
+    ]});
+    const spinBG_posB = device.createBindGroup({ layout: spinPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: velB } },
+      { binding: 2, resource: { buffer: simParamsBuf } },
+      { binding: 3, resource: { buffer: spinBuf } },
+    ]});
+
     // Frame loop
     let readFromA = true;
     let lastT = performance.now();
+    let frameCount = 0;
     function frame() {
       const now = performance.now();
       const dtMs = now - lastT; lastT = now;
       writeMats();
       simParams[0] = dt; simParams[1] = G; simParams[2] = 1.0; simParams[3] = particleCount; // eps = 1.0
       writeSimParams();
+      writeRepulse(); // ensure R updates
+
+      // Force spin = 1.0 for first 10 frames, then use UI-controlled value
+      if (frameCount < 10) {
+        spinParams[0] = 1.0;
+        device.queue.writeBuffer(spinBuf, 0, spinParams);
+      } else {
+        writeSpin();
+      }
 
       const enc = device.createCommandEncoder();
 
@@ -650,6 +771,15 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
       device.queue.writeBuffer(pairCount, 0, new Uint32Array([0]));
       device.queue.writeBuffer(locks, 0, new Uint32Array(particleCount));
       device.queue.writeBuffer(claims, 0, new Uint32Array(particleCount));
+
+      // New: Apply spin injection to current velocity buffer
+      {
+        const p = enc.beginComputePass();
+        p.setPipeline(spinPipe);
+        p.setBindGroup(0, readFromA ? spinBG_posA : spinBG_posB);
+        p.dispatchWorkgroups(Math.ceil(particleCount / 256));
+        p.end();
+      }
 
       // 1) Detect pairs at start-of-step (pre-integration) and store ΔE, normals
       {
@@ -693,6 +823,7 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
 
       device.queue.submit([enc.finish()]);
 
+      frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
       requestAnimationFrame(frame);
     }
