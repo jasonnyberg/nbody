@@ -792,7 +792,7 @@ struct Window { w: u32, _p1: u32, _p2: u32, _p3: u32 }
 @group(0) @binding(1) var<storage, read> Pvel: Vec4Buf;
 @group(0) @binding(2) var<storage, read> M: FloatBuf;
 @group(0) @binding(3) var<uniform> S: SimParams;
-@group(0) @binding(4) var<storage, read> pc: PairCount;
+@group(0) @binding(4) var<storage, read_write> pc: PairCount; // read_write for atomicAdd
 @group(0) @binding(5) var<storage, read_write> pb: Pairs;
 @group(0) @binding(6) var<uniform> C: Coll;
 @group(0) @binding(7) var<storage, read> idx: Keys; // sorted indices
@@ -807,7 +807,7 @@ fn encodeNormal(n: vec3<f32>) -> vec2<u32> {
 }
 
 @compute @workgroup_size(128)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let k = gid.x;
   let n = u32(S.numParticlesF);
   if (k >= n) { return; }
@@ -819,10 +819,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let w = W.w;
 
   // Scan a window in sorted order around k
-  let start = (k > w) ? (k - w) : 0u;
+  var start: u32 = 0u;
+  if (k > w) { start = k - w; }
   let end = min(n - 1u, k + w);
-  var count: u32 = 0u;
-  for (var t = start; t <= end; t = t + 1u) {
+  for (var t: u32 = start; t <= end; t = t + 1u) {
     if (t == k) { continue; }
     let j = idx.data[t];
     if (j <= i) { continue; } // de-dup
@@ -840,13 +840,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let invL = inverseSqrt(max(d2, 1e-12));
         let nhat = dp * invL;
         let packed = encodeNormal(nhat);
-        // NOTE: pairCount is read-only here to avoid a race; we reuse the global atomic from non-Morton variant.
-        // This kernel expects pairCount to be the same buffer but we can't increment atomically if read-only.
+        let idxPair = atomicAdd(&pc.value, 1u);
+        if (idxPair < ${MAX_PAIRS}u) {
+          pb.data[idxPair] = vec4<u32>(i, j, packed.x, packed.y);
+        }
       }
     }
   }
 }
 `;
+
+    // Pipelines (compute + render)
+    const integrateModule = device.createShaderModule({ code: integrateWGSL });
+    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
+    const detectModule = device.createShaderModule({ code: detectPairsWGSL });
+    const detectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectModule, entryPoint: 'main' } });
+    const splitModule = device.createShaderModule({ code: splitWGSL });
+    const splitPipe = device.createComputePipeline({ layout: 'auto', compute: { module: splitModule, entryPoint: 'main' } });
+
+    const renderModule = device.createShaderModule({ code: renderWGSL });
+    const renderPipe = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: renderModule, entryPoint: 'vs' },
+      fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
+      primitive: { topology: 'triangle-strip', cullMode: 'none' }
+    });
 
     // Pipelines for Morton + sort
     const mortonModule = device.createShaderModule({ code: mortonWGSL });
