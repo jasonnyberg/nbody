@@ -252,7 +252,7 @@
       mats[32] = canvas.width;  // viewport W
       mats[33] = canvas.height; // viewport H
       mats[34] = 18.0;          // sprite sizeScale in pixels (smaller)
-      mats[35] = Math.log(1.0 + 8.0); // normalization helper (not used strictly)
+      mats[35] = 1.0 / Math.log(1.0 + 8.0); // inverse log(maxMass+1) for mass normalization
       device.queue.writeBuffer(matsBuf, 0, mats);
     }
     writeMats();
@@ -295,6 +295,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     mi = M.data[i];
   }
   var a = vec3<f32>(0.0);
+  var radiate_mag: f32 = 0.0; // accumulate |a_radiate| like nbody3
   var base: u32 = 0u;
   loop {
     if (base >= n) { break; }
@@ -333,6 +334,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
             let vj = tVel[k].xyz;
             let closingSpeed = dot(d, v - vj);
             aRad = Rd.c * closingSpeed * invR; // acceleration magnitude along dir
+            radiate_mag = radiate_mag + abs(aRad);
           }
           let aMag = aG - aR - aRad;
           a = a + dir * aMag;
@@ -348,7 +350,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     // apply multiplicative damping like nbody3 (direct factor 0..1)
     v = v * D.factor;
     p = p + v * P.dt;
-    posOut.data[i] = vec4<f32>(p, 0.0);
+    posOut.data[i] = vec4<f32>(p, radiate_mag); // store radiative magnitude for coloring
     velOut.data[i] = vec4<f32>(v, 0.0);
   }
 }
@@ -488,7 +490,7 @@ fn decodeNormal(packed: vec2<u32>) -> vec3<f32> {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let k = gid.x;
   let total = atomicLoad(&pc.value);
   if (k >= total) { return; }
@@ -599,7 +601,12 @@ struct Mats { m: array<vec4<f32>, 10>, }
 @group(0) @binding(1) var<storage, read> M: FloatBuf;
 @group(0) @binding(2) var<uniform> U: Mats;
 
-struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) col: vec3<f32>, };
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) radiate: f32,
+  @location(2) massNorm: f32,
+};
 
 fn loadMat(idx: u32) -> mat4x4<f32> {
   let b = idx * 4u;
@@ -609,7 +616,8 @@ fn loadMat(idx: u32) -> mat4x4<f32> {
 @vertex
 fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
   // Per-instance particle index
-  let world = Ppos.data[iid].xyz;
+  let pos4 = Ppos.data[iid];
+  let world = pos4.xyz;
   let mass = M.data[iid];
 
   // Cull dead particles (mass <= 0)
@@ -617,7 +625,8 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSO
     var out: VSOut;
     out.pos = vec4<f32>(2.0, 2.0, 1.0, 1.0);
     out.uv = vec2<f32>(2.0);
-    out.col = vec3<f32>(0.0);
+    out.radiate = 0.0;
+    out.massNorm = 0.0;
     return out;
   }
 
@@ -635,9 +644,9 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSO
   let viewPos = view * vec4<f32>(world, 1.0);
   let clip = proj * viewPos;
 
-  // Viewport and size parameters packed at U.m[8]: (width, height, sizeScale, _)
+  // Viewport and size parameters packed at U.m[8]: (width, height, sizeScale, invLogMax)
   let vp = U.m[8u];
-  let width = vp.x; let height = vp.y; let sizeScale = vp.z;
+  let width = vp.x; let height = vp.y; let sizeScale = vp.z; let invLogMax = vp.w;
   // Depth-scaled size similar to nbody3
   let baseSize = max(1.0, pow(max(mass, 0.0), 0.3333));
   let sizePx = max(2.0, sizeScale * baseSize / max(1.0, -viewPos.z));
@@ -648,13 +657,14 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSO
    -2.0 * corner.y * sizePx / max(1.0, height)
   ) * clip.w;
 
+  // Mass normalization for color like nbody3
+  let mNorm = clamp(log(1.0 + max(mass, 0.0)) * invLogMax, 0.0, 1.0);
+
   var out: VSOut;
   out.pos = vec4<f32>(clip.xy + offsetClip, clip.z, clip.w);
   out.uv = corner; // pass to fragment for circular mask
-  let t = clamp(mass / 8.0, 0.0, 1.0);
-  let c0 = vec3<f32>(0.2,0.6,1.0);
-  let c1 = vec3<f32>(1.0,0.8,0.2);
-  out.col = c0 * (1.0 - t) + c1 * t;
+  out.radiate = pos4.w;
+  out.massNorm = mNorm;
   return out;
 }
 
@@ -664,7 +674,11 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
   if (r > 1.0) { discard; }
   // Soft edge alpha
   let alpha = clamp((1.0 - r) / 0.3, 0.0, 1.0);
-  return vec4<f32>(in.col, alpha);
+  // Radiative coloring like nbody3: red from radiate, green/blue from mass
+  let redRadiate = clamp(5.0 * in.radiate, 0.0, 1.0);
+  let g = in.massNorm;
+  let b = 1.0 - in.massNorm;
+  return vec4<f32>(redRadiate, g, b, alpha);
 }
 `;
 
