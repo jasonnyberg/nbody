@@ -74,6 +74,8 @@
   "use strict";
   (async () => {
     const canvas = document.getElementById('c');
+    const overlay = document.getElementById('overlay');
+    const octx = overlay.getContext('2d');
     const statsDiv = document.getElementById('stats');
     if (!('gpu' in navigator)) { alert('WebGPU not supported'); return; }
 
@@ -89,6 +91,8 @@
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
       canvas.height = Math.floor(canvas.clientHeight * dpr);
+      overlay.width = canvas.width;
+      overlay.height = canvas.height;
       context.configure({ device, format, alphaMode: 'opaque' });
     }
     resize();
@@ -219,7 +223,7 @@
     })();
 
     // Simulation setup (simple random sphere)
-    const particleCount = 65536; // keep moderate (O(N^2) pair find)
+    const particleCount = 64; // small for debugging overlays
     const stride = 4; // vec4
     const stateBytes = particleCount * stride * 4;
 
@@ -1469,15 +1473,140 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rp.setBindGroup(0, readFromA ? renderBG_posA : renderBG_posB);
         rp.draw(4, particleCount);
         rp.end();
+
+        // enqueue copy for CPU debug overlay
+        enc.copyBufferToBuffer(readFromA ? posA : posB, 0, readbackPos, 0, stateBytes);
+        enc.copyBufferToBuffer(readFromA ? velA : velB, 0, readbackVel, 0, stateBytes);
       }
 
       device.queue.submit([enc.finish()]);
+
+      // Draw overlay after GPU submit (non-blocking map)
+      drawOverlay();
 
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
       requestAnimationFrame(frame);
     }
-    requestAnimationFrame(frame);
+
+    async function drawOverlay(){
+      octx.clearRect(0,0,overlay.width, overlay.height);
+      // map last frame data
+      try{
+        await readbackPos.mapAsync(GPUMapMode.READ);
+        await readbackVel.mapAsync(GPUMapMode.READ);
+      } catch(e) { return; }
+      const pArr = new Float32Array(readbackPos.getMappedRange());
+      const vArr = new Float32Array(readbackVel.getMappedRange());
+
+      // Snapshot proj/view from GPU uniforms
+      // Recompute like writeMats() to match
+      const W = canvas.width, H = canvas.height;
+      const projSnap = perspective(Math.PI/4, W/H, 0.1, 1e7);
+      updateView();
+      const viewSnap = view;
+
+      // Pairwise and net forces (CPU, for visualization only)
+      // Colors: gravity (cyan), repulsion (magenta), radiative drag (yellow), net (white)
+      // Only draw for small N
+      const n = particleCount;
+      for (let i=0;i<n;i++){
+        const io = i*4;
+        const pi = [pArr[io], pArr[io+1], pArr[io+2]];
+        const vi = [vArr[io], vArr[io+1], vArr[io+2]];
+        let aNet = [0,0,0];
+        for (let j=i+1;j<n;j++){
+          const jo = j*4;
+          const pj = [pArr[jo], pArr[jo+1], pArr[jo+2]];
+          const vj = [vArr[jo], vArr[jo+1], vArr[jo+2]];
+          const dx = [pj[0]-pi[0], pj[1]-pi[1], pj[2]-pi[2]];
+          const r2 = dx[0]*dx[0]+dx[1]*dx[1]+dx[2]*dx[2] + 1.0; // eps^2
+          const r = Math.sqrt(r2);
+          const dir = [dx[0]/r, dx[1]/r, dx[2]/r];
+          // simple unit masses for viz
+          const aG = (G) / r2;
+          const aR = (R) / (r2*r2);
+          const closing = (dx[0]*(vi[0]-vj[0]) + dx[1]*(vi[1]-vj[1]) + dx[2]*(vi[2]-vj[2]))/r;
+          const aRad = (aR >= aG) ? (radiativeDamping * closing / r) : 0.0;
+          const aPair = [ dir[0]*(aG - aR - aRad), dir[1]*(aG - aR - aRad), dir[2]*(aG - aR - aRad) ];
+          aNet[0]+=aPair[0]; aNet[1]+=aPair[1]; aNet[2]+=aPair[2];
+          if (showPairs) {
+            drawVector(pi, aPair, projSnap, viewSnap, W, H, 'rgba(0,255,255,0.7)'); // cyan
+            drawVector(pj, [-aPair[0],-aPair[1],-aPair[2]], projSnap, viewSnap, W, H, 'rgba(0,255,255,0.7)');
+            // repulsion magenta
+            const aRep = [ dir[0]*aR, dir[1]*aR, dir[2]*aR ];
+            drawVector(pi, [-aRep[0],-aRep[1],-aRep[2]], projSnap, viewSnap, W, H, 'rgba(255,0,255,0.5)');
+            drawVector(pj, aRep, projSnap, viewSnap, W, H, 'rgba(255,0,255,0.5)');
+            // radiative yellow if active
+            if (aRad !== 0.0){
+              const aRadV = [ dir[0]*aRad, dir[1]*aRad, dir[2]*aRad ];
+              drawVector(pi, [-aRadV[0],-aRadV[1],-aRadV[2]], projSnap, viewSnap, W, H, 'rgba(255,255,0,0.6)');
+              drawVector(pj, aRadV, projSnap, viewSnap, W, H, 'rgba(255,255,0,0.6)');
+            }
+          }
+        }
+        if (showNet) drawVector(pi, aNet, projSnap, viewSnap, W, H, 'rgba(255,255,255,0.9)');
+      }
+
+      // Draw simple CPU octree boxes: compute AABB of all, then split into 8 octants (one level)
+      if (showBoxes){
+        const pts = [];
+        for (let i=0;i<n;i++){ const o=i*4; pts.push([pArr[o],pArr[o+1],pArr[o+2]]); }
+        const root = aabbOf(pts);
+        drawAABB(root.min, root.max, projSnap, viewSnap, W, H, 'rgba(0,128,255,0.5)');
+        const octs = splitOct(root, 1); // 1 level
+        for (const box of octs){ drawAABB(box.min, box.max, projSnap, viewSnap, W, H, 'rgba(0,255,128,0.35)'); }
+      }
+
+      readbackPos.unmap();
+      readbackVel.unmap();
+    }
+
+    function drawVector(p, a, proj, view, W, H, color){
+      // scale into screen space
+      const scale = 100 * vecScale; // tune
+      const q = [ p[0] + a[0]*scale, p[1] + a[1]*scale, p[2] + a[2]*scale ];
+      const s0 = project(p, proj, view, W, H);
+      const s1 = project(q, proj, view, W, H);
+      if (!isFinite(s0[0]) || !isFinite(s1[0])) return;
+      octx.strokeStyle = color;
+      octx.lineWidth = 2;
+      octx.beginPath();
+      octx.moveTo(s0[0], s0[1]);
+      octx.lineTo(s1[0], s1[1]);
+      octx.stroke();
+      // arrow head
+      const vx = s1[0] - s0[0], vy = s1[1] - s0[1];
+      const len = Math.hypot(vx,vy) || 1;
+      const ux = vx/len, uy = vy/len;
+      const size = 6;
+      octx.beginPath();
+      octx.moveTo(s1[0], s1[1]);
+      octx.lineTo(s1[0] - ux*size - uy*size*0.5, s1[1] - uy*size + ux*size*0.5);
+      octx.lineTo(s1[0] - ux*size + uy*size*0.5, s1[1] - uy*size - ux*size*0.5);
+      octx.closePath();
+      octx.fillStyle = color;
+      octx.fill();
+    }
+
+    function aabbOf(pts){
+      const min=[1e30,1e30,1e30], max=[-1e30,-1e30,-1e30];
+      for(const p of pts){ for(let k=0;k<3;k++){ if(p[k]<min[k])min[k]=p[k]; if(p[k]>max[k])max[k]=p[k]; } }
+      return {min,max};
+    }
+    function splitOct(box, levels){
+      const {min,max} = box; const c=[(min[0]+max[0])/2,(min[1]+max[1])/2,(min[2]+max[2])/2];
+      const octs=[];
+      for(let xi=0;xi<2;xi++) for(let yi=0;yi<2;yi++) for(let zi=0;zi<2;zi++){
+        const mn=[ xi?c[0]:min[0], yi?c[1]:min[1], zi?c[2]:min[2] ];
+        const mx=[ xi?max[0]:c[0], yi?max[1]:c[1], zi?max[2]:c[2] ];
+        octs.push({min:mn,max:mx});
+      }
+      if (levels<=1) return octs; // stop
+      const child=[];
+      for(const o of octs){ child.push(...splitOct(o, levels-1)); }
+      return child;
+    }
   })();
   </script>
 </body>
