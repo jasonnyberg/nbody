@@ -202,7 +202,7 @@
     }
 
     // Orbit camera (simple)
-    let az = 0.3, el = 0.6, dist = 2000.0;
+    let az = 0.3, el = 0.6, dist = 400.0;
     function updateView() {
       const ce = Math.cos(el), se = Math.sin(el), sa = Math.sin(az), ca = Math.cos(az);
       const eye = [ dist * ce * sa, dist * se, dist * ce * ca ];
@@ -1125,8 +1125,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       mats.set(view, 16);
       mats[32] = canvas.width;  // viewport W
       mats[33] = canvas.height; // viewport H
-      mats[34] = 18.0;          // sprite sizeScale in pixels
-      mats[35] = 1.0 / Math.log(1.0 + 8.0); // inverse log(maxMass+1)
+      mats[34] = 24.0;          // sprite sizeScale in pixels (bigger for debug)
+      mats[35] = 1.0 / Math.log(1.0 + 8.0);
       device.queue.writeBuffer(matsBuf, 0, mats);
     }
     writeMats();
