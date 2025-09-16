@@ -1,0 +1,8 @@
+g .85
+dt .01
+restitution 1
+radius 5
+repulsion r 10
+damping .900
+radiative .70
+
