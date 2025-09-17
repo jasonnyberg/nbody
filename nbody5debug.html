@@ -85,14 +85,31 @@
     const WG_SIZE = 128; // tuned workgroup size
     const MORTON_BITS = 10; // 10 bits/axis => 1024^3 grid
 
+    const overlay = document.getElementById('overlay');
     function resize() {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
       canvas.height = Math.floor(canvas.clientHeight * dpr);
+      overlay.width = canvas.width;
+      overlay.height = canvas.height;
       context.configure({ device, format, alphaMode: 'opaque' });
     }
     resize();
     addEventListener('resize', resize);
+
+    function drawOverlayQuad() {
+      const ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      ctx.save();
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = '#00FF00';
+      // Draw a centered quad, 200x200 px
+      const w = 200, h = 200;
+      const x = (overlay.width - w) / 2;
+      const y = (overlay.height - h) / 2;
+      ctx.fillRect(x, y, w, h);
+      ctx.restore();
+    }
 
     // Simple parameters/UI
     let G = 0.30;
@@ -1475,6 +1492,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
+      drawOverlayQuad();
       requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
