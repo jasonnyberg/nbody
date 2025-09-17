@@ -371,6 +371,8 @@
   const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   // Small persistent readback buffer for the first few pair entries (4 entries = 64 bytes)
   const pairBufReadback = device.createBuffer({ size: 4 * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  // Small persistent readback buffer for the first particle position (vec4<f32> = 16 bytes)
+  const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     // Morton keys + index buffers
@@ -875,6 +877,16 @@
         p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
         p.end();
         readFromA = !readFromA;
+        // Debug: copy the first particle's position from the active buffer to CPU-visible buffer
+        try {
+          const dbgPosEnc = device.createCommandEncoder();
+          dbgPosEnc.copyBufferToBuffer(readFromA ? posB : posA, 0, posReadback, 0, 16);
+          device.queue.submit([dbgPosEnc.finish()]);
+          await posReadback.mapAsync(GPUMapMode.READ);
+          const p0 = new Float32Array(posReadback.getMappedRange()).slice(0,4);
+          console.log('post-integrate firstPos (x,y,z,w)=', p0);
+          posReadback.unmap();
+        } catch(e) { console.warn('post-integrate pos readback failed', e); }
       }
 
       // Split using pairs from this frame (if any)
