@@ -365,7 +365,7 @@
 
     // Collision pair buffers (very simple)
     const MAX_PAIRS = Math.min(particleCount * 8, 262144);
-  const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }); // vec4<u32>
+  const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }); // vec4<u32>
   const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   // Small persistent readback buffer for debugging pairCount
   const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -811,11 +811,21 @@
           p1.setBindGroup(0, readFromA ? detectMortonBG_posA : detectMortonBG_posB);
           p1.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
           p1.end();
-          // SMOKE TEST: force pairCount to a small nonzero value so the lines renderer
-          // will attempt to draw pairs even if the compute shader left pairCount=0.
-          // Remove this after debugging.
-          device.queue.writeBuffer(pairCount, 0, new Uint32Array([8]));
-          console.log('SMOKE TEST: forced pairCount=8');
+          // SMOKE TEST: populate the first few entries of pairBuf with known
+          // pairs so the lines renderer has something concrete to draw. This
+          // is safer than forcing pairCount alone because we also fill pairBuf.
+          // Remove after debugging.
+          try {
+            const testPairs = new Uint32Array([
+              0, 1, 0, 0,
+              2, 3, 0, 0,
+              4, 5, 0, 0,
+              6, 7, 0, 0,
+            ]);
+            device.queue.writeBuffer(pairBuf, 0, testPairs);
+            device.queue.writeBuffer(pairCount, 0, new Uint32Array([4]));
+            console.log('SMOKE TEST: wrote 4 test pairs to pairBuf and set pairCount=4');
+          } catch (e) { console.warn('SMOKE TEST write failed', e); }
           // Immediate debug readback of pairCount after detectMorton
           try {
             const dbgEnc2 = device.createCommandEncoder();
