@@ -62,7 +62,8 @@
 
     <!-- Debug overlays -->
     <label><input id="showPairs" type="checkbox" checked /> Show pairwise force vectors</label>
-  <label><input id="showInitialPairs" type="checkbox" checked /> Show initial pair vectors (CPU)</label>
+  <label><input id="showInitialPairs" type="checkbox" /> Show initial pair vectors (CPU)</label>
+  <label><input id="showDynamicPairs" type="checkbox" checked /> Show dynamic CPU pairs (distance threshold)</label>
     <label><input id="showNet" type="checkbox" checked /> Show net force vectors</label>
     <label><input id="showBoxes" type="checkbox" checked /> Show octree boxes (CPU 1–2 levels)</label>
     <label>Vector scale: <span id="vecScaleVal">1.0</span></label>
@@ -128,47 +129,91 @@
       }
       // Read current particle positions from GPU
       let posBuffer = readFromA ? posA : posB;
+      // First: copy pos buffer and pairCount (small)
       const posReadBuf = device.createBuffer({ size: particleCount * stride * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const pairCountReadBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-      const pairBufReadBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-      const commandEncoder = device.createCommandEncoder();
-      commandEncoder.copyBufferToBuffer(posBuffer, 0, posReadBuf, 0, particleCount * stride * 4);
-      commandEncoder.copyBufferToBuffer(pairCount, 0, pairCountReadBuf, 0, 4);
-      commandEncoder.copyBufferToBuffer(pairBuf, 0, pairBufReadBuf, 0, MAX_PAIRS * 16);
-      device.queue.submit([commandEncoder.finish()]);
+      let enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(posBuffer, 0, posReadBuf, 0, particleCount * stride * 4);
+      enc.copyBufferToBuffer(pairCount, 0, pairCountReadBuf, 0, 4);
+      device.queue.submit([enc.finish()]);
+
+      // Wait for pos and pairCount to map
       await Promise.all([
         posReadBuf.mapAsync(GPUMapMode.READ),
-        pairCountReadBuf.mapAsync(GPUMapMode.READ),
-        pairBufReadBuf.mapAsync(GPUMapMode.READ)
+        pairCountReadBuf.mapAsync(GPUMapMode.READ)
       ]);
+
       const posArray = new Float32Array(posReadBuf.getMappedRange());
       const pairCountArray = new Uint32Array(pairCountReadBuf.getMappedRange());
-      const pairArray = new Uint32Array(pairBufReadBuf.getMappedRange());
-      const numPairs = pairCountArray[0];
-      for (let k = 0; k < numPairs; ++k) {
-        // Each pair is stored as a vec4<u32>: i, j, unused, unused
-        const i = pairArray[k * 4];
-        const j = pairArray[k * 4 + 1];
-        const o1 = i * stride;
-        const o2 = j * stride;
-        const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
-        const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
-        const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
-        const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.stroke();
+      const numPairs = Math.min(pairCountArray[0] || 0, MAX_PAIRS);
+
+  if (numPairs > 0) {
+        // Now copy only the needed range of pairBuf (numPairs * 16 bytes)
+        const pairBytes = numPairs * 16;
+        const pairBufReadBuf = device.createBuffer({ size: pairBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const enc2 = device.createCommandEncoder();
+        enc2.copyBufferToBuffer(pairBuf, 0, pairBufReadBuf, 0, pairBytes);
+        device.queue.submit([enc2.finish()]);
+        await pairBufReadBuf.mapAsync(GPUMapMode.READ);
+        const pairArray = new Uint32Array(pairBufReadBuf.getMappedRange());
+
+        for (let k = 0; k < numPairs; ++k) {
+          // Each pair is stored as a vec4<u32>: i, j, unused, unused
+          const i = pairArray[k * 4];
+          const j = pairArray[k * 4 + 1];
+          const o1 = i * stride;
+          const o2 = j * stride;
+          const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
+          const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
+          const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
+          const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+
+        pairBufReadBuf.unmap();
       }
+
+      // If GPU produced no pairs but user wants dynamic CPU pairs, compute them from posArray
+      const showDynamic = document.getElementById('showDynamicPairs')?.checked;
+      if (numPairs === 0 && showDynamic) {
+        // Use the already-mapped posArray for CPU pair detection
+        const maxPairsDraw = 1024;
+        const distThresh = 50.0 * (parseFloat(document.getElementById('vecScale')?.value || '1.0'));
+        let drawn = 0;
+        for (let i = 0; i < particleCount && drawn < maxPairsDraw; ++i) {
+          const o1 = i * stride;
+          const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
+          const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
+          for (let j = i + 1; j < particleCount && drawn < maxPairsDraw; ++j) {
+            const o2 = j * stride;
+            const dx = posArray[o2] - posArray[o1];
+            const dy = posArray[o2 + 1] - posArray[o1 + 1];
+            const dz = posArray[o2 + 2] - posArray[o1 + 2];
+            const d = Math.hypot(dx, dy, dz);
+            if (d <= distThresh) {
+              const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
+              const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
+              ctx.beginPath();
+              ctx.moveTo(x1, y1);
+              ctx.lineTo(x2, y2);
+              ctx.stroke();
+              drawn++;
+            }
+          }
+        }
+      }
+
       posReadBuf.unmap();
       pairCountReadBuf.unmap();
-      pairBufReadBuf.unmap();
       ctx.restore();
     }
 
     // Simple parameters/UI
-    let G = 0.30;
-    let dt = 0.20;
+    let G = 3.30;
+    let dt = 0.50;
     let restitution = 1.00; // used as alpha in energy restitution
     let radiusFactor = 2.0; // new: scales collision radii
     let R = 10.0;           // new: short-range repulsion strength (like nbody3)
@@ -322,6 +367,10 @@
     const MAX_PAIRS = Math.min(particleCount * 8, 262144);
   const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }); // vec4<u32>
   const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  // Small persistent readback buffer for debugging pairCount
+  const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  // Small persistent readback buffer for the first few pair entries (4 entries = 64 bytes)
+  const pairBufReadback = device.createBuffer({ size: 4 * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     // Morton keys + index buffers
@@ -468,6 +517,16 @@
 
     const integrateBHModule = device.createShaderModule({ code: integrateBHWGSL });
     const integrateBHPipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateBHModule, entryPoint: 'main' } });
+
+    // Lines pipeline (GPU render of pair vectors)
+    const linesWGSL = await (await fetch('scripts/lines.wgsl')).text();
+    const linesModule = device.createShaderModule({ code: linesWGSL });
+    const linesPipe = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: linesModule, entryPoint: 'vs' },
+      fragment: { module: linesModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
+      primitive: { topology: 'line-list', stripIndexFormat: undefined, cullMode: 'none' }
+    });
 
     // Bind groups for Morton
     const mortonBG_posA = device.createBindGroup({ layout: mortonPipe.getBindGroupLayout(0), entries: [
@@ -645,6 +704,20 @@
       { binding: 2, resource: { buffer: matsBuf } },
     ]});
 
+    // Lines bind groups (posA/posB)
+    const linesBG_posA = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: pairBuf } },
+      { binding: 2, resource: { buffer: matsBuf } },
+      { binding: 3, resource: { buffer: pairCount } },
+    ]});
+    const linesBG_posB = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: pairBuf } },
+      { binding: 2, resource: { buffer: matsBuf } },
+      { binding: 3, resource: { buffer: pairCount } },
+    ]});
+
     // Removed separate spin bind groups (spin is applied in integrate)
 
     // Frame loop
@@ -738,12 +811,43 @@
           p1.setBindGroup(0, readFromA ? detectMortonBG_posA : detectMortonBG_posB);
           p1.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
           p1.end();
+          // SMOKE TEST: force pairCount to a small nonzero value so the lines renderer
+          // will attempt to draw pairs even if the compute shader left pairCount=0.
+          // Remove this after debugging.
+          device.queue.writeBuffer(pairCount, 0, new Uint32Array([8]));
+          console.log('SMOKE TEST: forced pairCount=8');
+          // Immediate debug readback of pairCount after detectMorton
+          try {
+            const dbgEnc2 = device.createCommandEncoder();
+            dbgEnc2.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
+            dbgEnc2.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, 4 * 16);
+            device.queue.submit([dbgEnc2.finish()]);
+            await pairCountReadback.mapAsync(GPUMapMode.READ);
+            await pairBufReadback.mapAsync(GPUMapMode.READ);
+            const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
+            const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
+            console.log('post-detectMorton pairCount=', dbgVal, 'pairsPreview[0..7]=', pairsPreview.slice(0, 8));
+            pairCountReadback.unmap(); pairBufReadback.unmap();
+          } catch (e) { console.warn('post-detectMorton readback failed', e); }
         } else {
           const p0 = enc.beginComputePass();
           p0.setPipeline(detectPipe);
           p0.setBindGroup(0, readFromA ? detectBG_posA : detectBG_posB);
           p0.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
           p0.end();
+          // Immediate debug readback of pairCount after detect
+          try {
+            const dbgEnc2 = device.createCommandEncoder();
+            dbgEnc2.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
+            dbgEnc2.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, 4 * 16);
+            device.queue.submit([dbgEnc2.finish()]);
+            await pairCountReadback.mapAsync(GPUMapMode.READ);
+            await pairBufReadback.mapAsync(GPUMapMode.READ);
+            const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
+            const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
+            console.log('post-detect pairCount=', dbgVal, 'pairsPreview[0..7]=', pairsPreview.slice(0, 8));
+            pairCountReadback.unmap(); pairBufReadback.unmap();
+          } catch (e) { console.warn('post-detect readback failed', e); }
         }
       }
 
@@ -779,10 +883,31 @@
         rp.setPipeline(renderPipe);
         rp.setBindGroup(0, readFromA ? renderBG_posA : renderBG_posB);
         rp.draw(4, particleCount);
+        // Draw GPU pair vectors directly into the main canvas
+        rp.setPipeline(linesPipe);
+        rp.setBindGroup(0, readFromA ? linesBG_posA : linesBG_posB);
+        // Each instance emits 2 vertices (line-list). Instance count = MAX_PAIRS
+        rp.draw(2, MAX_PAIRS);
         rp.end();
       }
 
       device.queue.submit([enc.finish()]);
+
+      // Debug: every 30 frames, read back pairCount and log to console
+      if ((frameCount % 30) === 0) {
+        const dbgEnc = device.createCommandEncoder();
+        dbgEnc.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
+        device.queue.submit([dbgEnc.finish()]);
+        try {
+          await pairCountReadback.mapAsync(GPUMapMode.READ);
+          const rc = new Uint32Array(pairCountReadback.getMappedRange())[0];
+          console.log('pairCount (frame', frameCount, ')=', rc);
+        } catch (e) {
+          console.warn('pairCount readback failed', e);
+        } finally {
+          try { pairCountReadback.unmap(); } catch(e) {}
+        }
+      }
 
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
