@@ -1,3 +1,6 @@
+// render.wgsl
+// Purpose: Renders particles as instanced sprites with radiative and mass-based coloring.
+// Structure: Vertex and fragment entry points. Computes per-particle size, color, and alpha mask for circular sprites. Cull dead particles.
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
 struct Mats { m: array<vec4<f32>, 10>, }

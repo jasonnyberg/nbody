@@ -1,3 +1,6 @@
+// detectMorton.wgsl
+// Purpose: Detects close particle pairs for collision using Morton-sorted indices and a fixed neighbor window.
+// Structure: One compute entry point. Scans sorted window, checks pairwise distances, encodes collision normal, writes pairs to output buffer.
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
 struct PairCount { value: atomic<u32>, }

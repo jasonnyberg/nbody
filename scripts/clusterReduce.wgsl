@@ -1,3 +1,6 @@
+// clusterReduce.wgsl
+// Purpose: Reduces clusters of Morton-sorted particles to compute total mass, center of mass, and bounding radius for Barnes–Hut integration.
+// Structure: One compute entry point. Sums mass and position, computes bounding box, outputs cluster properties for far-field gravity.
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
 struct Keys { data: array<u32>, }

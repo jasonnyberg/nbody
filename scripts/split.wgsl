@@ -1,3 +1,6 @@
+// split.wgsl
+// Purpose: Handles collision response by splitting particle velocities according to angular-momentum and energy restitution.
+// Structure: One compute entry point. Uses atomic locks and claims to avoid double splits. Decodes collision normal, computes new velocities, and updates output buffer.
 struct PairCount { value: atomic<u32>, }
 struct Pairs { data: array<vec4<u32>>, }
 struct Vec4Buf { data: array<vec4<f32>>, }

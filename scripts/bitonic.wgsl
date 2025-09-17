@@ -1,3 +1,6 @@
+// bitonic.wgsl
+// Purpose: Performs bitonic sort on Morton keys and indices for spatial ordering.
+// Structure: One compute entry point. Swaps keys and indices based on sort stage parameters. Used for efficient neighbor search and clustering.
 struct Keys { data: array<u32>, }
 struct Params { j: u32, k: u32, n: u32, _pad: u32 }
 @group(0) @binding(0) var<storage, read_write> keys: Keys;

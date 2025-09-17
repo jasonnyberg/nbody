@@ -1,3 +1,6 @@
+// morton.wgsl
+// Purpose: Computes Morton codes for spatial sorting of particles in 3D.
+// Structure: One compute entry point. Maps positions to [0,1], encodes as 30-bit Morton code, writes keys and indices to output buffers.
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct Keys { data: array<u32>, }
 struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }

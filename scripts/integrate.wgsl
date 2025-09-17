@@ -1,3 +1,6 @@
+// integrate.wgsl
+// Purpose: Integrates particle positions and velocities using direct N-body gravity, repulsion, radiative damping, and optional spin.
+// Structure: One compute entry point. Uses workgroup-shared memory for efficient force calculation. Applies forces, updates velocities and positions, and writes results to output buffers.
 struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
 struct Vec4Buf { data: array<vec4<f32>>, }
 struct FloatBuf { data: array<f32>, }
