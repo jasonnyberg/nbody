@@ -10,7 +10,6 @@ struct Mats { m: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<storage, read> posBuf: Vec4Buf;
 @group(0) @binding(1) var<storage, read> pairBuf: array<vec4<u32>>;
 @group(0) @binding(2) var<uniform> U: Mats;
-@group(0) @binding(3) var<storage, read> pairCountBuf: UIntBuf; // kept for compatibility but not used
 
 fn loadMat(idx: u32) -> mat4x4<f32> {
   let b = idx * 4u;

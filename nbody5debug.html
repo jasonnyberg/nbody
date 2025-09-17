@@ -336,7 +336,7 @@
     })();
 
     // Simulation setup (simple random sphere)
-    const particleCount = 128; // keep moderate (O(N^2) pair find)
+    const particleCount = 32; // keep moderate (O(N^2) pair find)
     const stride = 4; // vec4
     const stateBytes = particleCount * stride * 4;
 
@@ -365,8 +365,10 @@
 
     // Collision pair buffers (very simple)
     const MAX_PAIRS = Math.min(particleCount * 8, 262144);
-  const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST }); // vec4<u32>
+  const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
   const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  // Visualization-only pair buffer (CPU-writable) to avoid mutating the simulation pairBuf
+  const visPairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   // Small persistent readback buffer for debugging pairCount
   const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   // Small persistent readback buffer for the first few pair entries (4 entries = 64 bytes)
@@ -709,15 +711,13 @@
     // Lines bind groups (posA/posB)
     const linesBG_posA = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: pairBuf } },
+      { binding: 1, resource: { buffer: visPairBuf } },
       { binding: 2, resource: { buffer: matsBuf } },
-      { binding: 3, resource: { buffer: pairCount } },
     ]});
     const linesBG_posB = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: pairBuf } },
+      { binding: 1, resource: { buffer: visPairBuf } },
       { binding: 2, resource: { buffer: matsBuf } },
-      { binding: 3, resource: { buffer: pairCount } },
     ]});
 
     // Removed separate spin bind groups (spin is applied in integrate)
@@ -726,6 +726,11 @@
     let readFromA = true;
     let lastT = performance.now();
     let frameCount = 0;
+    // Debug: always populate pairBuf with all unique pairs (i<j) up to MAX_PAIRS
+    // Useful for visualization at small particle counts. Set to false to disable.
+    const alwaysShowAllPairs = true;
+    // Overlay canvas (2D) draw control. When false, the old 2D overlay is not drawn.
+    const showOverlay = false;
   async function frame() {
       const now = performance.now();
       const dtMs = now - lastT; lastT = now;
@@ -824,9 +829,8 @@
               4, 5, 0, 0,
               6, 7, 0, 0,
             ]);
-            device.queue.writeBuffer(pairBuf, 0, testPairs);
-            device.queue.writeBuffer(pairCount, 0, new Uint32Array([4]));
-            console.log('SMOKE TEST: wrote 4 test pairs to pairBuf and set pairCount=4');
+            device.queue.writeBuffer(visPairBuf, 0, testPairs);
+            // SMOKE TEST: wrote test pairs (silent)
           } catch (e) { console.warn('SMOKE TEST write failed', e); }
           // Immediate debug readback of pairCount after detectMorton
           try {
@@ -838,7 +842,7 @@
             await pairBufReadback.mapAsync(GPUMapMode.READ);
             const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
             const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
-            console.log('post-detectMorton pairCount=', dbgVal, 'pairsPreview[0..7]=', pairsPreview.slice(0, 8));
+            // post-detectMorton debug readback (silent)
             pairCountReadback.unmap(); pairBufReadback.unmap();
           } catch (e) { console.warn('post-detectMorton readback failed', e); }
         } else {
@@ -857,7 +861,7 @@
             await pairBufReadback.mapAsync(GPUMapMode.READ);
             const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
             const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
-            console.log('post-detect pairCount=', dbgVal, 'pairsPreview[0..7]=', pairsPreview.slice(0, 8));
+            // post-detect debug readback (silent)
             pairCountReadback.unmap(); pairBufReadback.unmap();
           } catch (e) { console.warn('post-detect readback failed', e); }
         }
@@ -884,7 +888,7 @@
           device.queue.submit([dbgPosEnc.finish()]);
           await posReadback.mapAsync(GPUMapMode.READ);
           const p0 = new Float32Array(posReadback.getMappedRange()).slice(0,4);
-          console.log('post-integrate firstPos (x,y,z,w)=', p0);
+    // post-integrate firstPos readback (silent)
           posReadback.unmap();
         } catch(e) { console.warn('post-integrate pos readback failed', e); }
       }
@@ -900,6 +904,25 @@
 
       // Render
       {
+        // If debug mode enabled, populate pairBuf with all (i<j) pairs on the CPU
+        if (alwaysShowAllPairs) {
+          try {
+            const maxPairsToWrite = Math.min(MAX_PAIRS, Math.floor(particleCount*(particleCount-1)/2));
+            const cpuPairs = new Uint32Array(maxPairsToWrite * 4); // vec4<u32>
+            let idx = 0;
+            for (let i=0; i<particleCount && idx < maxPairsToWrite; i++) {
+              for (let j=i+1; j<particleCount && idx < maxPairsToWrite; j++) {
+                const off = idx * 4;
+                cpuPairs[off+0] = i;
+                cpuPairs[off+1] = j;
+                cpuPairs[off+2] = 0;
+                cpuPairs[off+3] = 0;
+                idx++;
+              }
+            }
+            device.queue.writeBuffer(visPairBuf, 0, cpuPairs);
+          } catch(e) { console.warn('alwaysShowAllPairs write failed', e); }
+        }
         const viewTex = context.getCurrentTexture().createView();
         const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
         rp.setPipeline(renderPipe);
@@ -923,7 +946,7 @@
         try {
           await pairCountReadback.mapAsync(GPUMapMode.READ);
           const rc = new Uint32Array(pairCountReadback.getMappedRange())[0];
-          console.log('pairCount (frame', frameCount, ')=', rc);
+          // pairCount periodic readback (silent)
         } catch (e) {
           console.warn('pairCount readback failed', e);
         } finally {
@@ -933,7 +956,7 @@
 
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
-  await drawOverlayQuad();
+  if (showOverlay) await drawOverlayQuad();
   requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
