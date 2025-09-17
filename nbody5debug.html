@@ -101,13 +101,32 @@
       const ctx = overlay.getContext('2d');
       ctx.clearRect(0, 0, overlay.width, overlay.height);
       ctx.save();
-      ctx.globalAlpha = 0.7;
-      ctx.fillStyle = '#00FF00';
-      // Draw a centered quad, 200x200 px
-      const w = 200, h = 200;
-      const x = (overlay.width - w) / 2;
-      const y = (overlay.height - h) / 2;
-      ctx.fillRect(x, y, w, h);
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = '#00FF00';
+      ctx.lineWidth = 1.0;
+      // Read current particle positions from GPU
+      let posBuffer = readFromA ? posA : posB;
+      const readBuf = device.createBuffer({ size: particleCount * stride * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const commandEncoder = device.createCommandEncoder();
+      commandEncoder.copyBufferToBuffer(posBuffer, 0, readBuf, 0, particleCount * stride * 4);
+      device.queue.submit([commandEncoder.finish()]);
+      await readBuf.mapAsync(GPUMapMode.READ);
+      const posArray = new Float32Array(readBuf.getMappedRange());
+      for (let i = 0; i < particleCount; ++i) {
+        const o1 = i * stride;
+        const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
+        const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
+        for (let j = i + 1; j < particleCount; ++j) {
+          const o2 = j * stride;
+          const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
+          const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+      }
+      readBuf.unmap();
       ctx.restore();
     }
 
@@ -236,7 +255,7 @@
     })();
 
     // Simulation setup (simple random sphere)
-    const particleCount = 65536; // keep moderate (O(N^2) pair find)
+    const particleCount = 128; // keep moderate (O(N^2) pair find)
     const stride = 4; // vec4
     const stateBytes = particleCount * stride * 4;
 
@@ -1365,8 +1384,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       writeSimParams();
       writeRepulse(); // ensure R updates
       writeRad();     // ensure radiative damping updates
-      // Force spin = 1.0 for first 10 frames, then use UI-controlled value
-      if (frameCount < 10) { spinParams[0] = 1.0; device.queue.writeBuffer(spinBuf, 0, spinParams); } else { writeSpin(); }
+      //// Force spin = 1.0 for first 10 frames, then use UI-controlled value
+      //if (frameCount < 10) { spinParams[0] = 1.0; device.queue.writeBuffer(spinBuf, 0, spinParams); } else { writeSpin(); }
 
       const enc = device.createCommandEncoder();
 
