@@ -62,6 +62,7 @@
 
     <!-- Debug overlays -->
     <label><input id="showPairs" type="checkbox" checked /> Show pairwise force vectors</label>
+  <label><input id="showInitialPairs" type="checkbox" checked /> Show initial pair vectors (CPU)</label>
     <label><input id="showNet" type="checkbox" checked /> Show net force vectors</label>
     <label><input id="showBoxes" type="checkbox" checked /> Show octree boxes (CPU 1–2 levels)</label>
     <label>Vector scale: <span id="vecScaleVal">1.0</span></label>
@@ -104,29 +105,64 @@
       ctx.globalAlpha = 0.5;
       ctx.strokeStyle = '#00FF00';
       ctx.lineWidth = 1.0;
+      // Fast CPU-only debug path: draw initial pairs from posInit
+      const showInitial = document.getElementById('showInitialPairs')?.checked;
+      if (showInitial) {
+        // posInit is a Float32Array with stride entries per particle
+        for (let i = 0; i < particleCount; ++i) {
+          const o1 = i * stride;
+          const x1 = overlay.width * (0.5 + posInit[o1] / (2 * 800));
+          const y1 = overlay.height * (0.5 - posInit[o1 + 1] / (2 * 800));
+          for (let j = i + 1; j < particleCount; ++j) {
+            const o2 = j * stride;
+            const x2 = overlay.width * (0.5 + posInit[o2] / (2 * 800));
+            const y2 = overlay.height * (0.5 - posInit[o2 + 1] / (2 * 800));
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+        return;
+      }
       // Read current particle positions from GPU
       let posBuffer = readFromA ? posA : posB;
-      const readBuf = device.createBuffer({ size: particleCount * stride * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const posReadBuf = device.createBuffer({ size: particleCount * stride * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const pairCountReadBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const pairBufReadBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
       const commandEncoder = device.createCommandEncoder();
-      commandEncoder.copyBufferToBuffer(posBuffer, 0, readBuf, 0, particleCount * stride * 4);
+      commandEncoder.copyBufferToBuffer(posBuffer, 0, posReadBuf, 0, particleCount * stride * 4);
+      commandEncoder.copyBufferToBuffer(pairCount, 0, pairCountReadBuf, 0, 4);
+      commandEncoder.copyBufferToBuffer(pairBuf, 0, pairBufReadBuf, 0, MAX_PAIRS * 16);
       device.queue.submit([commandEncoder.finish()]);
-      await readBuf.mapAsync(GPUMapMode.READ);
-      const posArray = new Float32Array(readBuf.getMappedRange());
-      for (let i = 0; i < particleCount; ++i) {
+      await Promise.all([
+        posReadBuf.mapAsync(GPUMapMode.READ),
+        pairCountReadBuf.mapAsync(GPUMapMode.READ),
+        pairBufReadBuf.mapAsync(GPUMapMode.READ)
+      ]);
+      const posArray = new Float32Array(posReadBuf.getMappedRange());
+      const pairCountArray = new Uint32Array(pairCountReadBuf.getMappedRange());
+      const pairArray = new Uint32Array(pairBufReadBuf.getMappedRange());
+      const numPairs = pairCountArray[0];
+      for (let k = 0; k < numPairs; ++k) {
+        // Each pair is stored as a vec4<u32>: i, j, unused, unused
+        const i = pairArray[k * 4];
+        const j = pairArray[k * 4 + 1];
         const o1 = i * stride;
+        const o2 = j * stride;
         const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
         const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
-        for (let j = i + 1; j < particleCount; ++j) {
-          const o2 = j * stride;
-          const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
-          const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.stroke();
-        }
+        const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
+        const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
       }
-      readBuf.unmap();
+      posReadBuf.unmap();
+      pairCountReadBuf.unmap();
+      pairBufReadBuf.unmap();
       ctx.restore();
     }
 
@@ -284,8 +320,8 @@
 
     // Collision pair buffers (very simple)
     const MAX_PAIRS = Math.min(particleCount * 8, 262144);
-    const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE }); // vec4<u32>
-    const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }); // vec4<u32>
+  const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
     const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     // Morton keys + index buffers
@@ -384,15 +420,6 @@
     const clusterReduceWGSL = await (await fetch('scripts/clusterReduce.wgsl')).text();
     const integrateBHWGSL = await (await fetch('scripts/integrateBH.wgsl')).text();
  
-
-
-    
-    
-
-
-
-   
-
     // Matrices + viewport params in a 10-vec4 uniform for alignment
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
     let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
