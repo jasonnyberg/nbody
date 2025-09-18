@@ -12,6 +12,7 @@
 </head>
 <body>
   <canvas id="c"></canvas>
+  <canvas id="overlay" style="position:fixed;left:0;top:0;pointer-events:none"></canvas>
   <div id="ui">
     <div><b>Controls</b></div>
     <label>G: <span id="gVal">0.30</span></label>
@@ -52,14 +53,21 @@
     <label>Neighbor window: <span id="winVal">64</span></label>
     <input id="win" type="range" min="8" max="256" step="8" value="64" />
 
-  <!-- Barnes–Hut (always enabled) -->
+    <!-- New: Barnes–Hut controls -->
+    <label><input id="bhOn" type="checkbox" checked /> Barnes–Hut gravity</label>
     <label>Opening angle θ: <span id="thetaVal">0.60</span></label>
     <input id="theta" type="range" min="0.2" max="1.0" step="0.05" value="0.60" />
     <label>Cluster size: <span id="clSizeVal">64</span></label>
     <input id="clSize" type="range" min="16" max="256" step="16" value="64" />
 
-    <!-- Minimal debug controls -->
+    <!-- Debug overlays -->
     <label><input id="showPairs" type="checkbox" checked /> Show pairwise force vectors</label>
+    <label><input id="showInitialPairs" type="checkbox" /> Show initial pair vectors (CPU)</label>
+    <label><input id="showDynamicPairs" type="checkbox" checked /> Show dynamic CPU pairs (distance threshold)</label>
+    <label><input id="showNet" type="checkbox" checked /> Show net force vectors</label>
+    <label><input id="showBoxes" type="checkbox" checked /> Show octree boxes (CPU 1–2 levels)</label>
+    <label>Vector scale: <span id="vecScaleVal">1.0</span></label>
+    <input id="vecScale" type="range" min="0.1" max="10" step="0.1" value="1.0" />
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
@@ -73,38 +81,135 @@
 
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }) || await navigator.gpu.requestAdapter();
     if (!adapter) { alert('No GPU adapter'); return; }
-    // Some platforms default to conservative limits. If the adapter reports it
-    // supports a higher maxStorageBuffersPerShaderStage, request a device with
-    // that higher limit so our compute pipelines with many storage buffers can
-    // be created. If not supported, we'll proceed with the default device and
-    // fall back (already implemented) to omit optional visualization bindings.
-    const desiredStorageBuffers = 10;
-    let device;
-    try {
-      const supportStorage = adapter.limits && adapter.limits.maxStorageBuffersPerShaderStage;
-      const requiredLimits = {};
-      if (supportStorage && supportStorage >= desiredStorageBuffers) {
-        requiredLimits.maxStorageBuffersPerShaderStage = desiredStorageBuffers;
-      }
-      device = await adapter.requestDevice({ requiredLimits });
-    } catch (e) {
-      console.warn('requestDevice with increased limits failed, falling back to default requestDevice()', e);
-      device = await adapter.requestDevice();
-    }
+    const device = await adapter.requestDevice();
     const context = canvas.getContext('webgpu');
     const format = navigator.gpu.getPreferredCanvasFormat();
     const WG_SIZE = 128; // tuned workgroup size
     const MORTON_BITS = 10; // 10 bits/axis => 1024^3 grid
 
+    const overlay = document.getElementById('overlay');
     function resize() {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
       canvas.height = Math.floor(canvas.clientHeight * dpr);
+      overlay.width = canvas.width;
+      overlay.height = canvas.height;
       context.configure({ device, format, alphaMode: 'opaque' });
     }
     resize();
     addEventListener('resize', resize);
-    // overlay removed for simplification; all debug visualization will be GPU rendered
+
+    async function drawOverlayQuad() {
+      const ctx = overlay.getContext('2d');
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      ctx.save();
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = '#00FF00';
+      ctx.lineWidth = 1.0;
+      // Fast CPU-only debug path: draw initial pairs from posInit
+      const showInitial = document.getElementById('showInitialPairs')?.checked;
+      if (showInitial) {
+        // posInit is a Float32Array with stride entries per particle
+        for (let i = 0; i < particleCount; ++i) {
+          const o1 = i * stride;
+          const x1 = overlay.width * (0.5 + posInit[o1] / (2 * 800));
+          const y1 = overlay.height * (0.5 - posInit[o1 + 1] / (2 * 800));
+          for (let j = i + 1; j < particleCount; ++j) {
+            const o2 = j * stride;
+            const x2 = overlay.width * (0.5 + posInit[o2] / (2 * 800));
+            const y2 = overlay.height * (0.5 - posInit[o2 + 1] / (2 * 800));
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+        return;
+      }
+      // Read current particle positions from GPU
+      let posBuffer = readFromA ? posA : posB;
+      // First: copy pos buffer and pairCount (small)
+      const posReadBuf = device.createBuffer({ size: particleCount * stride * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const pairCountReadBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      let enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(posBuffer, 0, posReadBuf, 0, particleCount * stride * 4);
+      enc.copyBufferToBuffer(pairCount, 0, pairCountReadBuf, 0, 4);
+      device.queue.submit([enc.finish()]);
+
+      // Wait for pos and pairCount to map
+      await Promise.all([
+        posReadBuf.mapAsync(GPUMapMode.READ),
+        pairCountReadBuf.mapAsync(GPUMapMode.READ)
+      ]);
+
+      const posArray = new Float32Array(posReadBuf.getMappedRange());
+      const pairCountArray = new Uint32Array(pairCountReadBuf.getMappedRange());
+      const numPairs = Math.min(pairCountArray[0] || 0, MAX_PAIRS);
+
+      if (numPairs > 0) {
+        // Now copy only the needed range of pairBuf (numPairs * 16 bytes)
+        const pairBytes = numPairs * 16;
+        const pairBufReadBuf = device.createBuffer({ size: pairBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        const enc2 = device.createCommandEncoder();
+        enc2.copyBufferToBuffer(pairBuf, 0, pairBufReadBuf, 0, pairBytes);
+        device.queue.submit([enc2.finish()]);
+        await pairBufReadBuf.mapAsync(GPUMapMode.READ);
+        const pairArray = new Uint32Array(pairBufReadBuf.getMappedRange());
+
+        for (let k = 0; k < numPairs; ++k) {
+          // Each pair is stored as a vec4<u32>: i, j, unused, unused
+          const i = pairArray[k * 4];
+          const j = pairArray[k * 4 + 1];
+          const o1 = i * stride;
+          const o2 = j * stride;
+          const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
+          const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
+          const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
+          const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+
+        pairBufReadBuf.unmap();
+      }
+
+      // If GPU produced no pairs but user wants dynamic CPU pairs, compute them from posArray
+      const showDynamic = document.getElementById('showDynamicPairs')?.checked;
+      if (numPairs === 0 && showDynamic) {
+        // Use the already-mapped posArray for CPU pair detection
+        const maxPairsDraw = 1024;
+        const distThresh = 50.0 * (parseFloat(document.getElementById('vecScale')?.value || '1.0'));
+        let drawn = 0;
+        for (let i = 0; i < particleCount && drawn < maxPairsDraw; ++i) {
+          const o1 = i * stride;
+          const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
+          const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
+          for (let j = i + 1; j < particleCount && drawn < maxPairsDraw; ++j) {
+            const o2 = j * stride;
+            const dx = posArray[o2] - posArray[o1];
+            const dy = posArray[o2 + 1] - posArray[o1 + 1];
+            const dz = posArray[o2 + 2] - posArray[o1 + 2];
+            const d = Math.hypot(dx, dy, dz);
+            if (d <= distThresh) {
+              const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
+              const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
+              ctx.beginPath();
+              ctx.moveTo(x1, y1);
+              ctx.lineTo(x2, y2);
+              ctx.stroke();
+              drawn++;
+            }
+          }
+        }
+      }
+
+      posReadBuf.unmap();
+      pairCountReadBuf.unmap();
+      ctx.restore();
+    }
 
     // Simple parameters/UI
     let G = 3.30;
@@ -171,12 +276,12 @@
     winEl.addEventListener('input', () => { neighborWindow = parseInt(winEl.value); winVal.textContent = String(neighborWindow); writeWindow(); });
 
     // New: BH UI wiring
-  const thetaEl = document.getElementById('theta');
-  const thetaVal = document.getElementById('thetaVal');
-  const clSizeEl = document.getElementById('clSize');
-  const clSizeVal = document.getElementById('clSizeVal');
-  // Barnes–Hut is always enabled; user cannot toggle it off.
-  // Keep theta/cluster size controls wired below.
+    const bhOnEl = document.getElementById('bhOn');
+    const thetaEl = document.getElementById('theta');
+    const thetaVal = document.getElementById('thetaVal');
+    const clSizeEl = document.getElementById('clSize');
+    const clSizeVal = document.getElementById('clSizeVal');
+    bhOnEl.addEventListener('change', () => { useBH = bhOnEl.checked; writeBHParams(); });
     thetaEl.addEventListener('input', () => { theta = parseFloat(thetaEl.value); thetaVal.textContent = theta.toFixed(2); writeBHParams(); });
     clSizeEl.addEventListener('input', () => { clusterSize = parseInt(clSizeEl.value); clSizeVal.textContent = String(clusterSize); writeBHParams(); });
 
@@ -256,21 +361,23 @@
   let posB = makeBuf(stateBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     let velA = bufFrom(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
     let velB = makeBuf(stateBytes, GPUBufferUsage.STORAGE);
-    const masses = bufFrom(massInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+    const masses = bufFrom(massInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
 
     // Collision pair buffers (very simple)
     const MAX_PAIRS = Math.min(particleCount * 8, 262144);
   const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
   const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   // Visualization-only pair buffer (CPU-writable) to avoid mutating the simulation pairBuf
-  const visPairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  // visualization pair count (atomic)
-  const visPairCountBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const visPairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   // Small persistent readback buffer for debugging pairCount
-  // CPU readback buffers removed to keep GPU-only rendering and avoid stalls.
-    const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    // Morton keys + index buffers
+  const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  // Small persistent readback buffer for the first few pair entries (4 entries = 64 bytes)
+  const pairBufReadback = device.createBuffer({ size: 4 * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  // Small persistent readback buffer for the first particle position (vec4<f32> = 16 bytes)
+  const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  // Morton keys + index buffers
     const mortonKeys = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const mortonIdx  = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
@@ -365,12 +472,12 @@
     const detectMortonWGSL = await (await fetch('scripts/detectMorton.wgsl')).text();
     const clusterReduceWGSL = await (await fetch('scripts/clusterReduce.wgsl')).text();
     const integrateBHWGSL = await (await fetch('scripts/integrateBH.wgsl')).text();
- 
+
     // Matrices + viewport params in a 10-vec4 uniform for alignment
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
     let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
     const mats = new Float32Array(40); // 10 * vec4
-  const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeMats() {
       proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
       updateView();
@@ -385,7 +492,8 @@
     writeMats();
 
     // Pipelines (compute + render)
-  // integrate (direct N^2) pipeline intentionally not created here; we always use Barnes–Hut integrate pipeline (integrateBH)
+    const integrateModule = device.createShaderModule({ code: integrateWGSL });
+    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
     const detectModule = device.createShaderModule({ code: detectPairsWGSL });
     const detectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectModule, entryPoint: 'main' } });
     const splitModule = device.createShaderModule({ code: splitWGSL });
@@ -490,54 +598,66 @@
     ]});
 
     // Bind groups for integrateBH (A->B and B->A)
-    // Integrate BH bind groups: try full set (including vis pair buffers),
-    // but fall back to omit vis buffers if the shader/pipeline doesn't declare them.
-    let integrateBHBG_AtoB;
-    let integrateBHBG_BtoA;
-    (function(){
-      const layout = integrateBHPipe.getBindGroupLayout(0);
-      const fullEntriesA = [
-        { binding: 0, resource: { buffer: posA } },
-        { binding: 1, resource: { buffer: velA } },
-        { binding: 2, resource: { buffer: posB } },
-        { binding: 3, resource: { buffer: velB } },
-        { binding: 4, resource: { buffer: simParamsBuf } },
-        { binding: 5, resource: { buffer: masses } },
-        { binding: 6, resource: { buffer: dampBuf } },
-        { binding: 7, resource: { buffer: repulseBuf } },
-        { binding: 8, resource: { buffer: radBuf } },
-        { binding: 9, resource: { buffer: spinBuf } },
-        { binding: 10, resource: { buffer: bhBuf } },
-        { binding: 11, resource: { buffer: mortonIdx } },
-        { binding: 12, resource: { buffer: clBuf } },
-        { binding: 13, resource: { buffer: clMassBuf } },
-        { binding: 14, resource: { buffer: clComBuf } },
-        { binding: 15, resource: { buffer: visPairCountBuf } },
-        { binding: 16, resource: { buffer: visPairBuf } },
-      ];
-      const fullEntriesB = fullEntriesA.map(e => {
-        // swap pos/vel buffers for B->A
-        const copy = Object.assign({}, e);
-        if (e.binding === 0) copy.resource.buffer = posB;
-        if (e.binding === 1) copy.resource.buffer = velB;
-        if (e.binding === 2) copy.resource.buffer = posA;
-        if (e.binding === 3) copy.resource.buffer = velA;
-        return copy;
-      });
-      try {
-        integrateBHBG_AtoB = device.createBindGroup({ layout, entries: fullEntriesA });
-        integrateBHBG_BtoA = device.createBindGroup({ layout, entries: fullEntriesB });
-      } catch (e) {
-        console.warn('integrateBH bind group failed, retrying without visPair buffers', e);
-        // fallback: remove entries with binding >= 15
-        const fallbackA = fullEntriesA.filter(en => en.binding < 15);
-        const fallbackB = fullEntriesB.filter(en => en.binding < 15);
-        integrateBHBG_AtoB = device.createBindGroup({ layout, entries: fallbackA });
-        integrateBHBG_BtoA = device.createBindGroup({ layout, entries: fallbackB });
-      }
-    })();
+    const integrateBHBG_AtoB = device.createBindGroup({ layout: integrateBHPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: velA } },
+      { binding: 2, resource: { buffer: posB } },
+      { binding: 3, resource: { buffer: velB } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+      { binding: 7, resource: { buffer: repulseBuf } },
+      { binding: 8, resource: { buffer: radBuf } },
+      { binding: 9, resource: { buffer: spinBuf } },
+      { binding: 10, resource: { buffer: bhBuf } },
+      { binding: 11, resource: { buffer: mortonIdx } },
+      { binding: 12, resource: { buffer: clBuf } },
+      { binding: 13, resource: { buffer: clMassBuf } },
+      { binding: 14, resource: { buffer: clComBuf } },
+    ]});
+    const integrateBHBG_BtoA = device.createBindGroup({ layout: integrateBHPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: velB } },
+      { binding: 2, resource: { buffer: posA } },
+      { binding: 3, resource: { buffer: velA } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+      { binding: 7, resource: { buffer: repulseBuf } },
+      { binding: 8, resource: { buffer: radBuf } },
+      { binding: 9, resource: { buffer: spinBuf } },
+      { binding: 10, resource: { buffer: bhBuf } },
+      { binding: 11, resource: { buffer: mortonIdx } },
+      { binding: 12, resource: { buffer: clBuf } },
+      { binding: 13, resource: { buffer: clMassBuf } },
+      { binding: 14, resource: { buffer: clComBuf } },
+    ]});
 
-    // Direct integrate (O(N^2)) bind groups removed: Barnes–Hut only.
+    // Compute bind groups
+    const integrateBG_AtoB = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: velA } },
+      { binding: 2, resource: { buffer: posB } },
+      { binding: 3, resource: { buffer: velB } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+      { binding: 7, resource: { buffer: repulseBuf } },
+      { binding: 8, resource: { buffer: radBuf } },
+      { binding: 9, resource: { buffer: spinBuf } }, // new spin
+    ]});
+    const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: velB } },
+      { binding: 2, resource: { buffer: posA } },
+      { binding: 3, resource: { buffer: velA } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+      { binding: 7, resource: { buffer: repulseBuf } },
+      { binding: 8, resource: { buffer: radBuf } },
+      { binding: 9, resource: { buffer: spinBuf } }, // new spin
+    ]});
 
     const detectBG_posA = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posA } },
@@ -588,36 +708,17 @@
       { binding: 2, resource: { buffer: matsBuf } },
     ]});
 
-    // Lines bind groups (posA/posB) — create defensively: some builds of the shader
-    // may not declare the cluster COM binding (binding 3). Try full entries and
-    // fall back without binding 3 if creation fails.
-    let linesBG_posA;
-    let linesBG_posB;
-    (function(){
-      const layout = linesPipe.getBindGroupLayout(0);
-      const fullA = [
-        { binding: 0, resource: { buffer: posA } },
-        { binding: 1, resource: { buffer: visPairBuf } },
-        { binding: 2, resource: { buffer: matsBuf } },
-        { binding: 3, resource: { buffer: clComBuf } },
-      ];
-      const fullB = [
-        { binding: 0, resource: { buffer: posB } },
-        { binding: 1, resource: { buffer: visPairBuf } },
-        { binding: 2, resource: { buffer: matsBuf } },
-        { binding: 3, resource: { buffer: clComBuf } },
-      ];
-      try {
-        linesBG_posA = device.createBindGroup({ layout, entries: fullA });
-        linesBG_posB = device.createBindGroup({ layout, entries: fullB });
-      } catch (e) {
-        console.warn('lines bind group failed, retrying without cluster COM binding', e);
-        const fallbackA = fullA.filter(en => en.binding < 3);
-        const fallbackB = fullB.filter(en => en.binding < 3);
-        linesBG_posA = device.createBindGroup({ layout, entries: fallbackA });
-        linesBG_posB = device.createBindGroup({ layout, entries: fallbackB });
-      }
-    })();
+    // Lines bind groups (posA/posB)
+    const linesBG_posA = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: visPairBuf } },
+      { binding: 2, resource: { buffer: matsBuf } },
+    ]});
+    const linesBG_posB = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: visPairBuf } },
+      { binding: 2, resource: { buffer: matsBuf } },
+    ]});
 
     // Removed separate spin bind groups (spin is applied in integrate)
 
@@ -628,7 +729,8 @@
     // Debug: always populate pairBuf with all unique pairs (i<j) up to MAX_PAIRS
     // Useful for visualization at small particle counts. Set to false to disable.
     const alwaysShowAllPairs = true;
-  // overlay removed
+    // Overlay canvas (2D) draw control. When false, the old 2D overlay is not drawn.
+    const showOverlay = false;
   async function frame() {
       const now = performance.now();
       const dtMs = now - lastT; lastT = now;
@@ -731,7 +833,18 @@
             // SMOKE TEST: wrote test pairs (silent)
           } catch (e) { console.warn('SMOKE TEST write failed', e); }
           // Immediate debug readback of pairCount after detectMorton
-          // CPU readbacks removed; skip post-detectMorton debug readback.
+          try {
+            const dbgEnc2 = device.createCommandEncoder();
+            dbgEnc2.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
+            dbgEnc2.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, 4 * 16);
+            device.queue.submit([dbgEnc2.finish()]);
+            await pairCountReadback.mapAsync(GPUMapMode.READ);
+            await pairBufReadback.mapAsync(GPUMapMode.READ);
+            const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
+            const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
+            // post-detectMorton debug readback (silent)
+            pairCountReadback.unmap(); pairBufReadback.unmap();
+          } catch (e) { console.warn('post-detectMorton readback failed', e); }
         } else {
           const p0 = enc.beginComputePass();
           p0.setPipeline(detectPipe);
@@ -739,23 +852,45 @@
           p0.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
           p0.end();
           // Immediate debug readback of pairCount after detect
-          // CPU readbacks removed; skip post-detect debug readback.
+          try {
+            const dbgEnc2 = device.createCommandEncoder();
+            dbgEnc2.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
+            dbgEnc2.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, 4 * 16);
+            device.queue.submit([dbgEnc2.finish()]);
+            await pairCountReadback.mapAsync(GPUMapMode.READ);
+            await pairBufReadback.mapAsync(GPUMapMode.READ);
+            const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
+            const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
+            // post-detect debug readback (silent)
+            pairCountReadback.unmap(); pairBufReadback.unmap();
+          } catch (e) { console.warn('post-detect readback failed', e); }
         }
       }
 
-      // Integrate all particles using Barnes–Hut (always)
+      // Integrate all particles (BH or direct)
       {
-        // reset visualization pair count for this frame so shaders can append
-        device.queue.writeBuffer(visPairCountBuf, 0, new Uint32Array([0]));
         const p = enc.beginComputePass();
-        writeBHParams(); // ensure uniforms updated
-        p.setPipeline(integrateBHPipe);
-        p.setBindGroup(0, readFromA ? integrateBHBG_AtoB : integrateBHBG_BtoA);
+        if (useBH) {
+          writeBHParams(); // ensure uniforms updated
+          p.setPipeline(integrateBHPipe);
+          p.setBindGroup(0, readFromA ? integrateBHBG_AtoB : integrateBHBG_BtoA);
+        } else {
+          p.setPipeline(integratePipe);
+          p.setBindGroup(0, readFromA ? integrateBG_AtoB : integrateBG_BtoA);
+        }
         p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
         p.end();
         readFromA = !readFromA;
         // Debug: copy the first particle's position from the active buffer to CPU-visible buffer
-        // CPU readbacks removed; skip post-integrate first-particle readback.
+        try {
+          const dbgPosEnc = device.createCommandEncoder();
+          dbgPosEnc.copyBufferToBuffer(readFromA ? posB : posA, 0, posReadback, 0, 16);
+          device.queue.submit([dbgPosEnc.finish()]);
+          await posReadback.mapAsync(GPUMapMode.READ);
+          const p0 = new Float32Array(posReadback.getMappedRange()).slice(0,4);
+          // post-integrate firstPos readback (silent)
+          posReadback.unmap();
+        } catch(e) { console.warn('post-integrate pos readback failed', e); }
       }
 
       // Split using pairs from this frame (if any)
@@ -788,11 +923,6 @@
             device.queue.writeBuffer(visPairBuf, 0, cpuPairs);
           } catch(e) { console.warn('alwaysShowAllPairs write failed', e); }
         }
-        // Small readback of visPairCount to set instance count for lines draw
-        let numVisPairs = MAX_PAIRS;
-        // No CPU readback for visPairCount; assume MAX_PAIRS as instance count fallback
-        numVisPairs = MAX_PAIRS;
-
         const viewTex = context.getCurrentTexture().createView();
         const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
         rp.setPipeline(renderPipe);
@@ -801,8 +931,8 @@
         // Draw GPU pair vectors directly into the main canvas
         rp.setPipeline(linesPipe);
         rp.setBindGroup(0, readFromA ? linesBG_posA : linesBG_posB);
-        // Each instance emits 2 vertices (line-list). Instance count = vis pair count
-        rp.draw(2, Math.max(1, numVisPairs));
+        // Each instance emits 2 vertices (line-list). Instance count = MAX_PAIRS
+        rp.draw(2, MAX_PAIRS);
         rp.end();
       }
 
@@ -810,17 +940,23 @@
 
       // Debug: every 30 frames, read back pairCount and log to console
       if ((frameCount % 30) === 0) {
-        // Periodic CPU readbacks removed.
-      }
-
-      // Additional debug: every 60 frames read back first 4 particle positions and masses
-      if ((frameCount % 60) === 0) {
-        // Additional periodic CPU debug readbacks removed.
+        const dbgEnc = device.createCommandEncoder();
+        dbgEnc.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
+        device.queue.submit([dbgEnc.finish()]);
+        try {
+          await pairCountReadback.mapAsync(GPUMapMode.READ);
+          const rc = new Uint32Array(pairCountReadback.getMappedRange())[0];
+          // pairCount periodic readback (silent)
+        } catch (e) {
+          console.warn('pairCount readback failed', e);
+        } finally {
+          try { pairCountReadback.unmap(); } catch(e) {}
+        }
       }
 
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
-  // overlay removed
+  if (showOverlay) await drawOverlayQuad();
   requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);

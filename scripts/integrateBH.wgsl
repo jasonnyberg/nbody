@@ -24,9 +24,6 @@ struct ClCom { data: array<vec4<f32>>, }
 @group(0) @binding(7) var<uniform> Rp: Repulse;
 @group(0) @binding(8) var<uniform> Rd: Rad;
 @group(0) @binding(9) var<uniform> Sp: Spin;
-struct PairCount { value: atomic<u32>, }
-@group(0) @binding(15) var<storage, read_write> visPairCount: PairCount;
-@group(0) @binding(16) var<storage, read_write> visPairs: array<vec4<u32>>;
 @group(0) @binding(10) var<uniform> B: BH;
 @group(0) @binding(11) var<storage, read> idx: Keys;
 @group(0) @binding(12) var<uniform> C: Cl;
@@ -85,9 +82,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 					radiate_mag = radiate_mag + abs(aRad);
 				}
 				let aMag = aG - aR - aRad;
-				// Emit debug pair for direct interaction
-				let vid = atomicAdd(&visPairCount.value, 1u);
-				if (vid < 262144u) { visPairs[vid] = vec4<u32>(i, j, 0u, 0u); }
 				a = a + dir * aMag;
 			}
 		} else {
@@ -101,9 +95,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 				let dir = d / max(r, 1e-6);
 				let aG = (P.G * mC) / r2;
 				a = a + dir * aG;
-				// For far-field cluster contribution, emit a single pair from particle to cluster COM
-				let vidC = atomicAdd(&visPairCount.value, 1u);
-				if (vidC < 262144u) { visPairs[vidC] = vec4<u32>(i, c, 1u, 0u); }
 			} else {
 				// too close: direct interactions with members of this cluster
 				let start = c * cSize;
@@ -130,9 +121,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 					}
 					let aMag2 = aG2 - aR2 - aRad2;
 					a = a + dir2 * aMag2;
-					// Emit debug pair for this member interaction
-					let vid2 = atomicAdd(&visPairCount.value, 1u);
-					if (vid2 < 262144u) { visPairs[vid2] = vec4<u32>(i, j, 0u, 0u); }
 				}
 			}
 		}

@@ -19,10 +19,6 @@ struct Spin { w: f32, _s0: f32, _s1: f32, _s2: f32 } // new spin uniform
 @group(0) @binding(8) var<uniform> Rd: Rad;
 @group(0) @binding(9) var<uniform> Sp: Spin; // spin now applied inside integrate
 
-struct PairCount { value: atomic<u32>, }
-@group(0) @binding(10) var<storage, read_write> visPairCount: PairCount;
-@group(0) @binding(11) var<storage, read_write> visPairs: array<vec4<u32>>;
-
 const WG: u32 = 128u;
 var<workgroup> tPos: array<vec4<f32>, WG>;
 var<workgroup> tVel: array<vec4<f32>, WG>;
@@ -84,15 +80,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 					}
 					let aMag = aG - aR - aRad;
 					a = a + dir * aMag;
-
-					// Emit a debug vector for this force calculation (write to visPairs)
-					let jidx = base + k;
-					if (jidx != i) {
-						let vidx = atomicAdd(&visPairCount.value, 1u);
-						if (vidx < 262144u) {
-							visPairs[vidx] = vec4<u32>(i, jidx, 0u, 0u);
-						}
-					}
 				}
 				k = k + 1u;
 			}
