@@ -710,22 +710,6 @@
 
       device.queue.submit([enc.finish()]);
 
-      // Debug: every 30 frames, read back pairCount and log to console
-      if ((frameCount % 30) === 0) {
-        const dbgEnc = device.createCommandEncoder();
-        dbgEnc.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
-        device.queue.submit([dbgEnc.finish()]);
-        try {
-          await pairCountReadback.mapAsync(GPUMapMode.READ);
-          const rc = new Uint32Array(pairCountReadback.getMappedRange())[0];
-          // pairCount periodic readback (silent)
-        } catch (e) {
-          console.warn('pairCount readback failed', e);
-        } finally {
-          try { pairCountReadback.unmap(); } catch(e) {}
-        }
-      }
-
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
   // overlay removed; GPU drawing handles debug visuals
