@@ -10,6 +10,7 @@ struct Mats { m: array<vec4<f32>, 10> }
 @group(0) @binding(0) var<storage, read> posBuf: Vec4Buf;
 @group(0) @binding(1) var<storage, read> pairBuf: array<vec4<u32>>;
 @group(0) @binding(2) var<uniform> U: Mats;
+@group(0) @binding(3) var<storage, read> clComBuf: Vec4Buf; // cluster COMs for BH far-field visualization
 
 fn loadMat(idx: u32) -> mat4x4<f32> {
   let b = idx * 4u;
@@ -25,9 +26,13 @@ fn vs(@builtin(vertex_index) v_idx: u32, @builtin(instance_index) inst: u32) -> 
     return vec4<f32>(2.0, 0.0, 0.0, 1.0);
   }
   var id: u32 = 0u;
-  if (v_idx == 0u) { id = p.x; } else { id = p.y; }
-  let pos4 = posBuf.data[id];
-  let pos = pos4.xyz;
+  var pos = vec3<f32>(0.0);
+  if (p.z == 1u) {
+    // cluster COM encoded: treat second component as cluster index
+    if (v_idx == 0u) { pos = posBuf.data[p.x].xyz; } else { pos = clComBuf.data[p.y].xyz; }
+  } else {
+    if (v_idx == 0u) { pos = posBuf.data[p.x].xyz; } else { pos = posBuf.data[p.y].xyz; }
+  }
   let world = vec4<f32>(pos, 1.0);
   let proj = loadMat(0u);
   let view = loadMat(1u);
