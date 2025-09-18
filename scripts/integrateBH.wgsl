@@ -13,6 +13,8 @@ struct Cl { size: u32, count: u32, _p2: u32, _p3: u32 }
 struct BH { theta: f32, _b0: f32, _b1: f32, _b2: f32 }
 struct ClMass { data: array<f32>, }
 struct ClCom { data: array<vec4<f32>>, }
+struct PairCount { value: atomic<u32>, }
+struct Pairs { data: array<vec4<u32>>, }
 
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
 @group(0) @binding(1) var<storage, read> velIn: Vec4Buf;
@@ -29,6 +31,8 @@ struct ClCom { data: array<vec4<f32>>, }
 @group(0) @binding(12) var<uniform> C: Cl;
 @group(0) @binding(13) var<storage, read> CM: ClMass;
 @group(0) @binding(14) var<storage, read> CC: ClCom;
+@group(0) @binding(15) var<storage, read_write> outPairs: Pairs;
+@group(0) @binding(16) var<storage, read_write> outPairCount: PairCount;
 
 @compute @workgroup_size(128)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -83,6 +87,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 				}
 				let aMag = aG - aR - aRad;
 				a = a + dir * aMag;
+				// record particle-particle force for visualization
+				let invL = inverseSqrt(max(dot(d,d), 1e-12));
+				let nhat = d * invL;
+				// pack normal's xy into u32s similar to other shaders
+				let nx = clamp(nhat.x * 32767.0, -32767.0, 32767.0);
+				let ny = clamp(nhat.y * 32767.0, -32767.0, 32767.0);
+				let p0 = (u32(i32(nx) & 0xFFFF) | (u32(i32(ny) & 0xFFFF) << 16));
+				let p1 = select(0u, 1u, nhat.z < 0.0);
+				let idxPair = atomicAdd(&outPairCount.value, 1u);
+				if (idxPair < 262144u) {
+					outPairs.data[idxPair] = vec4<u32>(i, j, p0, p1);
+				}
 			}
 		} else {
 			let com = CC.data[c].xyz;
@@ -95,6 +111,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 				let dir = d / max(r, 1e-6);
 				let aG = (P.G * mC) / r2;
 				a = a + dir * aG;
+				// record cluster COM interaction as visualization pair
+				let invL = inverseSqrt(max(dot(d,d), 1e-12));
+				let nhat = d * invL;
+				let nx = clamp(nhat.x * 32767.0, -32767.0, 32767.0);
+				let ny = clamp(nhat.y * 32767.0, -32767.0, 327.0);
+				let p0 = (u32(i32(nx) & 0xFFFF) | (u32(i32(ny) & 0xFFFF) << 16));
+				let p1 = select(0u, 1u, nhat.z < 0.0);
+				// encode cluster index by setting high bit
+				let clusterIdEnc = (0x80000000u | (c & 0x7FFFFFFFu));
+				let idxPair2 = atomicAdd(&outPairCount.value, 1u);
+				if (idxPair2 < 262144u) {
+					outPairs.data[idxPair2] = vec4<u32>(i, clusterIdEnc, p0, p1);
+				}
 			} else {
 				// too close: direct interactions with members of this cluster
 				let start = c * cSize;

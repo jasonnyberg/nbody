@@ -7,7 +7,7 @@ struct PairCount { value: atomic<u32>, }
 struct Pairs { data: array<vec4<u32>>, }
 struct Keys { data: array<u32>, }
 struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
-struct Coll { rf: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
+struct Coll { rf: f32, approach: f32, _pad1: f32, _pad2: f32 }
 struct Window { w: u32, _p1: u32, _p2: u32, _p3: u32 }
 
 @group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
@@ -58,7 +58,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 		let R = ri + rj;
 		if (d2 < R*R) {
 			let relv = Pvel.data[j].xyz - vi;
-			if (dot(dp, relv) < 0.0) {
+			// approach flag: if C.approach >= 0.5 we only record approaching pairs,
+			// otherwise record any proximal pair (useful for visualization/debug).
+			let approachOK = (C.approach < 0.5) || (dot(dp, relv) < 0.0);
+			if (approachOK) {
 				let invL = inverseSqrt(max(d2, 1e-12));
 				let nhat = dp * invL;
 				let packed = encodeNormal(nhat);
