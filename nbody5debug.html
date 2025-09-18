@@ -12,7 +12,6 @@
 </head>
 <body>
   <canvas id="c"></canvas>
-  <canvas id="overlay" style="position:fixed;left:0;top:0;pointer-events:none"></canvas>
   <div id="ui">
     <div><b>Controls</b></div>
     <label>G: <span id="gVal">0.30</span></label>
@@ -43,31 +42,21 @@
     <label>Radiative: <span id="radVal">0.005</span></label>
     <input id="rad" type="range" min="0.0" max="0.1" step="0.001" value="0.005" />
 
-    <!-- New: Collision controls -->
-    <label><input id="collideOn" type="checkbox" checked /> Collisions (detect/split)</label>
-    <label>Collide every k frames: <span id="collideKVal">1</span></label>
-    <input id="collideK" type="range" min="1" max="8" step="1" value="1" />
+  <!-- New: Collision controls -->
+  <label>Collide every k frames: <span id="collideKVal">1</span></label>
+  <input id="collideK" type="range" min="1" max="8" step="1" value="1" />
 
-    <!-- New: Octree (Morton) indexing for collisions -->
-    <label><input id="octOn" type="checkbox" checked /> Use octree index (Morton)</label>
-    <label>Neighbor window: <span id="winVal">64</span></label>
-    <input id="win" type="range" min="8" max="256" step="8" value="64" />
+  <!-- Morton (octree) indexing for collisions -->
+  <label>Neighbor window: <span id="winVal">64</span></label>
+  <input id="win" type="range" min="8" max="256" step="8" value="64" />
 
-    <!-- New: Barnes–Hut controls -->
-    <label><input id="bhOn" type="checkbox" checked /> Barnes–Hut gravity</label>
+  <!-- Barnes–Hut controls -->
     <label>Opening angle θ: <span id="thetaVal">0.60</span></label>
     <input id="theta" type="range" min="0.2" max="1.0" step="0.05" value="0.60" />
     <label>Cluster size: <span id="clSizeVal">64</span></label>
     <input id="clSize" type="range" min="16" max="256" step="16" value="64" />
 
-    <!-- Debug overlays -->
-    <label><input id="showPairs" type="checkbox" checked /> Show pairwise force vectors</label>
-    <label><input id="showInitialPairs" type="checkbox" /> Show initial pair vectors (CPU)</label>
-    <label><input id="showDynamicPairs" type="checkbox" checked /> Show dynamic CPU pairs (distance threshold)</label>
-    <label><input id="showNet" type="checkbox" checked /> Show net force vectors</label>
-    <label><input id="showBoxes" type="checkbox" checked /> Show octree boxes (CPU 1–2 levels)</label>
-    <label>Vector scale: <span id="vecScaleVal">1.0</span></label>
-    <input id="vecScale" type="range" min="0.1" max="10" step="0.1" value="1.0" />
+  <!-- Debug overlays rendered by GPU shader; toggles removed (always enabled via code) -->
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
   </div>
@@ -87,129 +76,14 @@
     const WG_SIZE = 128; // tuned workgroup size
     const MORTON_BITS = 10; // 10 bits/axis => 1024^3 grid
 
-    const overlay = document.getElementById('overlay');
     function resize() {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
       canvas.height = Math.floor(canvas.clientHeight * dpr);
-      overlay.width = canvas.width;
-      overlay.height = canvas.height;
       context.configure({ device, format, alphaMode: 'opaque' });
     }
     resize();
     addEventListener('resize', resize);
-
-    async function drawOverlayQuad() {
-      const ctx = overlay.getContext('2d');
-      ctx.clearRect(0, 0, overlay.width, overlay.height);
-      ctx.save();
-      ctx.globalAlpha = 0.5;
-      ctx.strokeStyle = '#00FF00';
-      ctx.lineWidth = 1.0;
-      // Fast CPU-only debug path: draw initial pairs from posInit
-      const showInitial = document.getElementById('showInitialPairs')?.checked;
-      if (showInitial) {
-        // posInit is a Float32Array with stride entries per particle
-        for (let i = 0; i < particleCount; ++i) {
-          const o1 = i * stride;
-          const x1 = overlay.width * (0.5 + posInit[o1] / (2 * 800));
-          const y1 = overlay.height * (0.5 - posInit[o1 + 1] / (2 * 800));
-          for (let j = i + 1; j < particleCount; ++j) {
-            const o2 = j * stride;
-            const x2 = overlay.width * (0.5 + posInit[o2] / (2 * 800));
-            const y2 = overlay.height * (0.5 - posInit[o2 + 1] / (2 * 800));
-            ctx.beginPath();
-            ctx.moveTo(x1, y1);
-            ctx.lineTo(x2, y2);
-            ctx.stroke();
-          }
-        }
-        ctx.restore();
-        return;
-      }
-      // Read current particle positions from GPU
-      let posBuffer = readFromA ? posA : posB;
-      // First: copy pos buffer and pairCount (small)
-      const posReadBuf = device.createBuffer({ size: particleCount * stride * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-      const pairCountReadBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-      let enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(posBuffer, 0, posReadBuf, 0, particleCount * stride * 4);
-      enc.copyBufferToBuffer(pairCount, 0, pairCountReadBuf, 0, 4);
-      device.queue.submit([enc.finish()]);
-
-      // Wait for pos and pairCount to map
-      await Promise.all([
-        posReadBuf.mapAsync(GPUMapMode.READ),
-        pairCountReadBuf.mapAsync(GPUMapMode.READ)
-      ]);
-
-      const posArray = new Float32Array(posReadBuf.getMappedRange());
-      const pairCountArray = new Uint32Array(pairCountReadBuf.getMappedRange());
-      const numPairs = Math.min(pairCountArray[0] || 0, MAX_PAIRS);
-
-      if (numPairs > 0) {
-        // Now copy only the needed range of pairBuf (numPairs * 16 bytes)
-        const pairBytes = numPairs * 16;
-        const pairBufReadBuf = device.createBuffer({ size: pairBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-        const enc2 = device.createCommandEncoder();
-        enc2.copyBufferToBuffer(pairBuf, 0, pairBufReadBuf, 0, pairBytes);
-        device.queue.submit([enc2.finish()]);
-        await pairBufReadBuf.mapAsync(GPUMapMode.READ);
-        const pairArray = new Uint32Array(pairBufReadBuf.getMappedRange());
-
-        for (let k = 0; k < numPairs; ++k) {
-          // Each pair is stored as a vec4<u32>: i, j, unused, unused
-          const i = pairArray[k * 4];
-          const j = pairArray[k * 4 + 1];
-          const o1 = i * stride;
-          const o2 = j * stride;
-          const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
-          const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
-          const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
-          const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.stroke();
-        }
-
-        pairBufReadBuf.unmap();
-      }
-
-      // If GPU produced no pairs but user wants dynamic CPU pairs, compute them from posArray
-      const showDynamic = document.getElementById('showDynamicPairs')?.checked;
-      if (numPairs === 0 && showDynamic) {
-        // Use the already-mapped posArray for CPU pair detection
-        const maxPairsDraw = 1024;
-        const distThresh = 50.0 * (parseFloat(document.getElementById('vecScale')?.value || '1.0'));
-        let drawn = 0;
-        for (let i = 0; i < particleCount && drawn < maxPairsDraw; ++i) {
-          const o1 = i * stride;
-          const x1 = overlay.width * (0.5 + posArray[o1] / (2 * 800));
-          const y1 = overlay.height * (0.5 - posArray[o1 + 1] / (2 * 800));
-          for (let j = i + 1; j < particleCount && drawn < maxPairsDraw; ++j) {
-            const o2 = j * stride;
-            const dx = posArray[o2] - posArray[o1];
-            const dy = posArray[o2 + 1] - posArray[o1 + 1];
-            const dz = posArray[o2 + 2] - posArray[o1 + 2];
-            const d = Math.hypot(dx, dy, dz);
-            if (d <= distThresh) {
-              const x2 = overlay.width * (0.5 + posArray[o2] / (2 * 800));
-              const y2 = overlay.height * (0.5 - posArray[o2 + 1] / (2 * 800));
-              ctx.beginPath();
-              ctx.moveTo(x1, y1);
-              ctx.lineTo(x2, y2);
-              ctx.stroke();
-              drawn++;
-            }
-          }
-        }
-      }
-
-      posReadBuf.unmap();
-      pairCountReadBuf.unmap();
-      ctx.restore();
-    }
 
     // Simple parameters/UI
     let G = 3.30;
@@ -220,11 +94,11 @@
     let spin = 0.00;        // new: tangential velocity injection rate (rad/s)
     let damping = 1.00;     // CHANGED: damping factor (0..1), applied directly to velocity (1.0 = no damping)
     let radiativeDamping = 0.005; // new: radiative damping coefficient
-    let collisionsEnabled = true; // new: toggle collisions
+  let collisionsEnabled = true; // collisions always enabled in this simplified build
     let collideEvery = 1;         // new: run collisions every k frames
-    let useMorton = true;         // new: toggle morton/octree indexing
+  let useMorton = true;         // morton/octree always used
     let neighborWindow = 64;      // new: neighbors to scan on each side in Morton order
-    let useBH = true;             // new: Barnes–Hut toggle
+  let useBH = true;             // Barnes–Hut always used
     let theta = 0.60;             // new: BH opening angle
     let clusterSize = 64;         // new: leaf capacity approximation
 
@@ -261,29 +135,23 @@
     const radVal = document.getElementById('radVal');
     radEl.addEventListener('input', () => { radiativeDamping = parseFloat(radEl.value); radVal.textContent = radiativeDamping.toFixed(3); writeRad(); });
 
-    // New: collision UI wiring
-    const collideOnEl = document.getElementById('collideOn');
-    const collideKEl = document.getElementById('collideK');
-    const collideKVal = document.getElementById('collideKVal');
-    collideOnEl.addEventListener('change', () => { collisionsEnabled = collideOnEl.checked; });
-    collideKEl.addEventListener('input', () => { collideEvery = parseInt(collideKEl.value); collideKVal.textContent = String(collideEvery); });
+  // New: collision UI wiring (collisions always on)
+  const collideKEl = document.getElementById('collideK');
+  const collideKVal = document.getElementById('collideKVal');
+  collideKEl.addEventListener('input', () => { collideEvery = parseInt(collideKEl.value); collideKVal.textContent = String(collideEvery); });
 
-    // New: Morton/octree UI wiring
-    const octOnEl = document.getElementById('octOn');
-    const winEl = document.getElementById('win');
-    const winVal = document.getElementById('winVal');
-    octOnEl.addEventListener('change', () => { useMorton = octOnEl.checked; });
-    winEl.addEventListener('input', () => { neighborWindow = parseInt(winEl.value); winVal.textContent = String(neighborWindow); writeWindow(); });
+  // New: Morton/octree UI wiring
+  const winEl = document.getElementById('win');
+  const winVal = document.getElementById('winVal');
+  winEl.addEventListener('input', () => { neighborWindow = parseInt(winEl.value); winVal.textContent = String(neighborWindow); writeWindow(); });
 
-    // New: BH UI wiring
-    const bhOnEl = document.getElementById('bhOn');
-    const thetaEl = document.getElementById('theta');
-    const thetaVal = document.getElementById('thetaVal');
-    const clSizeEl = document.getElementById('clSize');
-    const clSizeVal = document.getElementById('clSizeVal');
-    bhOnEl.addEventListener('change', () => { useBH = bhOnEl.checked; writeBHParams(); });
-    thetaEl.addEventListener('input', () => { theta = parseFloat(thetaEl.value); thetaVal.textContent = theta.toFixed(2); writeBHParams(); });
-    clSizeEl.addEventListener('input', () => { clusterSize = parseInt(clSizeEl.value); clSizeVal.textContent = String(clusterSize); writeBHParams(); });
+  // New: BH UI wiring
+  const thetaEl = document.getElementById('theta');
+  const thetaVal = document.getElementById('thetaVal');
+  const clSizeEl = document.getElementById('clSize');
+  const clSizeVal = document.getElementById('clSizeVal');
+  thetaEl.addEventListener('input', () => { theta = parseFloat(thetaEl.value); thetaVal.textContent = theta.toFixed(2); writeBHParams(); });
+  clSizeEl.addEventListener('input', () => { clusterSize = parseInt(clSizeEl.value); clSizeVal.textContent = String(clusterSize); writeBHParams(); });
 
     // Basic math helpers (column-major matrices like WebGPU expects)
     function perspective(fovy, aspect, near, far) {
@@ -463,8 +331,7 @@
 
     // WGSL Shaders
     // Load all WGSL shaders from external files
-    const integrateWGSL = await (await fetch('scripts/integrate.wgsl')).text();
-    const detectPairsWGSL = await (await fetch('scripts/detectPairs.wgsl')).text();
+  // integrate.wgsl and detectPairs.wgsl removed; using integrateBH and detectMorton
     const splitWGSL = await (await fetch('scripts/split.wgsl')).text();
     const renderWGSL = await (await fetch('scripts/render.wgsl')).text();
     const mortonWGSL = await (await fetch('scripts/morton.wgsl')).text();
@@ -492,10 +359,7 @@
     writeMats();
 
     // Pipelines (compute + render)
-    const integrateModule = device.createShaderModule({ code: integrateWGSL });
-    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
-    const detectModule = device.createShaderModule({ code: detectPairsWGSL });
-    const detectPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectModule, entryPoint: 'main' } });
+  // Direct integrate/detect pipelines removed; using Morton + Barnes–Hut paths only
     const splitModule = device.createShaderModule({ code: splitWGSL });
     const splitPipe = device.createComputePipeline({ layout: 'auto', compute: { module: splitModule, entryPoint: 'main' } });
 
@@ -633,50 +497,7 @@
       { binding: 14, resource: { buffer: clComBuf } },
     ]});
 
-    // Compute bind groups
-    const integrateBG_AtoB = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: velA } },
-      { binding: 2, resource: { buffer: posB } },
-      { binding: 3, resource: { buffer: velB } },
-      { binding: 4, resource: { buffer: simParamsBuf } },
-      { binding: 5, resource: { buffer: masses } },
-      { binding: 6, resource: { buffer: dampBuf } },
-      { binding: 7, resource: { buffer: repulseBuf } },
-      { binding: 8, resource: { buffer: radBuf } },
-      { binding: 9, resource: { buffer: spinBuf } }, // new spin
-    ]});
-    const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: velB } },
-      { binding: 2, resource: { buffer: posA } },
-      { binding: 3, resource: { buffer: velA } },
-      { binding: 4, resource: { buffer: simParamsBuf } },
-      { binding: 5, resource: { buffer: masses } },
-      { binding: 6, resource: { buffer: dampBuf } },
-      { binding: 7, resource: { buffer: repulseBuf } },
-      { binding: 8, resource: { buffer: radBuf } },
-      { binding: 9, resource: { buffer: spinBuf } }, // new spin
-    ]});
-
-    const detectBG_posA = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: velA } },
-      { binding: 2, resource: { buffer: masses } },
-      { binding: 3, resource: { buffer: simParamsBuf } },
-      { binding: 4, resource: { buffer: pairCount } },
-      { binding: 5, resource: { buffer: pairBuf } },
-      { binding: 6, resource: { buffer: radiusBuf } },
-    ]});
-    const detectBG_posB = device.createBindGroup({ layout: detectPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: velB } },
-      { binding: 2, resource: { buffer: masses } },
-      { binding: 3, resource: { buffer: simParamsBuf } },
-      { binding: 4, resource: { buffer: pairCount } },
-      { binding: 5, resource: { buffer: pairBuf } },
-      { binding: 6, resource: { buffer: radiusBuf } },
-    ]});
+    // Compute bind groups for direct integrate/detect removed (using BH + Morton paths)
 
     const splitBG_velA = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: velA } },
@@ -729,8 +550,7 @@
     // Debug: always populate pairBuf with all unique pairs (i<j) up to MAX_PAIRS
     // Useful for visualization at small particle counts. Set to false to disable.
     const alwaysShowAllPairs = true;
-    // Overlay canvas (2D) draw control. When false, the old 2D overlay is not drawn.
-    const showOverlay = false;
+  // Overlay canvas removed; GPU lines renderer is used for debug vectors
   async function frame() {
       const now = performance.now();
       const dtMs = now - lastT; lastT = now;
@@ -787,32 +607,8 @@
         device.queue.writeBuffer(locks, 0, new Uint32Array(particleCount));
         device.queue.writeBuffer(claims, 0, new Uint32Array(particleCount));
 
-        if (useMorton && !useBH) {
-          // Compute morton + sort for collisions if not already done for BH
-          {
-            const p0 = enc.beginComputePass();
-            p0.setPipeline(mortonPipe);
-            p0.setBindGroup(0, readFromA ? mortonBG_posA : mortonBG_posB);
-            p0.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-            p0.end();
-          }
-          let kStage2 = 2;
-          while (kStage2 <= particleCount) {
-            let jStage2 = kStage2 >> 1;
-            while (jStage2 > 0) {
-              writeSortJK(jStage2, kStage2);
-              const pS2 = enc.beginComputePass();
-              pS2.setPipeline(bitonicPipe);
-              pS2.setBindGroup(0, bitonicBG);
-              pS2.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-              pS2.end();
-              jStage2 >>= 1;
-            }
-            kStage2 <<= 1;
-          }
-        }
-
-        if (useMorton) {
+        // Use Morton-based neighbor detection for collisions
+        {
           const p1 = enc.beginComputePass();
           p1.setPipeline(detectMortonPipe);
           p1.setBindGroup(0, readFromA ? detectMortonBG_posA : detectMortonBG_posB);
@@ -845,39 +641,15 @@
             // post-detectMorton debug readback (silent)
             pairCountReadback.unmap(); pairBufReadback.unmap();
           } catch (e) { console.warn('post-detectMorton readback failed', e); }
-        } else {
-          const p0 = enc.beginComputePass();
-          p0.setPipeline(detectPipe);
-          p0.setBindGroup(0, readFromA ? detectBG_posA : detectBG_posB);
-          p0.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-          p0.end();
-          // Immediate debug readback of pairCount after detect
-          try {
-            const dbgEnc2 = device.createCommandEncoder();
-            dbgEnc2.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
-            dbgEnc2.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, 4 * 16);
-            device.queue.submit([dbgEnc2.finish()]);
-            await pairCountReadback.mapAsync(GPUMapMode.READ);
-            await pairBufReadback.mapAsync(GPUMapMode.READ);
-            const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
-            const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
-            // post-detect debug readback (silent)
-            pairCountReadback.unmap(); pairBufReadback.unmap();
-          } catch (e) { console.warn('post-detect readback failed', e); }
         }
       }
 
-      // Integrate all particles (BH or direct)
+      // Integrate all particles using Barnes–Hut
       {
         const p = enc.beginComputePass();
-        if (useBH) {
-          writeBHParams(); // ensure uniforms updated
-          p.setPipeline(integrateBHPipe);
-          p.setBindGroup(0, readFromA ? integrateBHBG_AtoB : integrateBHBG_BtoA);
-        } else {
-          p.setPipeline(integratePipe);
-          p.setBindGroup(0, readFromA ? integrateBG_AtoB : integrateBG_BtoA);
-        }
+        writeBHParams(); // ensure uniforms updated
+        p.setPipeline(integrateBHPipe);
+        p.setBindGroup(0, readFromA ? integrateBHBG_AtoB : integrateBHBG_BtoA);
         p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
         p.end();
         readFromA = !readFromA;
@@ -956,7 +728,7 @@
 
       frameCount++;
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
-  if (showOverlay) await drawOverlayQuad();
+  // overlay removed; GPU drawing handles debug visuals
   requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
