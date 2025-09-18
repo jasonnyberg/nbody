@@ -17,9 +17,11 @@ struct PairCount { value: atomic<u32>, }
 struct Pairs { data: array<vec4<u32>>, }
 
 @group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
-@group(0) @binding(1) var<storage, read> velIn: Vec4Buf;
+// Verlet: previous-position buffer replaces explicit velocity buffer
+@group(0) @binding(1) var<storage, read> prevPosIn: Vec4Buf;
 @group(0) @binding(2) var<storage, read_write> posOut: Vec4Buf;
-@group(0) @binding(3) var<storage, read_write> velOut: Vec4Buf;
+// write previous position for next step
+@group(0) @binding(3) var<storage, read_write> prevPosOut: Vec4Buf;
 @group(0) @binding(4) var<uniform> P: SimParams;
 @group(0) @binding(5) var<storage, read> M: FloatBuf;
 @group(0) @binding(6) var<uniform> D: Damp;
@@ -43,10 +45,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let mi = M.data[i];
 	let isActive = mi > 0.0;
 	var p = posIn.data[i].xyz;
-	var v = velIn.data[i].xyz;
+	// compute velocity from current and previous positions: v = (p - prev)/dt
+	var prev = prevPosIn.data[i].xyz;
+	var v = (p - prev) / P.dt;
 	if (!isActive) {
 		posOut.data[i] = posIn.data[i];
-		velOut.data[i] = velIn.data[i];
+		prevPosOut.data[i] = prevPosIn.data[i];
 		return;
 	}
 	let eps2 = P.eps * P.eps;
@@ -80,7 +84,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 				let aR = (Rp.k * mj) * invR6;
 				var aRad: f32 = 0.0;
 				if (aR >= aG) {
-					let vj = velIn.data[j].xyz;
+					// compute neighbor velocity from positions
+					let prevj = prevPosIn.data[j].xyz;
+					let vj = (posIn.data[j].xyz - prevj) / P.dt;
 					let closingSpeed = dot(d, v - vj);
 					aRad = Rd.c * closingSpeed * invR;
 					radiate_mag = radiate_mag + abs(aRad);
@@ -143,7 +149,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 					let aR2 = (Rp.k * mj) * invR6;
 					var aRad2: f32 = 0.0;
 					if (aR2 >= aG2) {
-						let vj2 = velIn.data[j].xyz;
+						let prevj2 = prevPosIn.data[j].xyz;
+						let vj2 = (posIn.data[j].xyz - prevj2) / P.dt;
 						let closingSpeed2 = dot(d2, v - vj2);
 						aRad2 = Rd.c * closingSpeed2 * invR;
 						radiate_mag = radiate_mag + abs(aRad2);
@@ -155,7 +162,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 		}
 	}
 
-	// Integrate
+	// Integrate using a simple velocity update (a = acceleration). For Verlet-style
+	// position integration we compute next position using current displacement and acceleration term.
+	// However some legacy logic applies spin to velocity; keep that by adjusting v before position update.
 	v = v + a * P.dt;
 	if (abs(Sp.w) > 0.0) {
 		let posXZ = p.xz;
@@ -167,8 +176,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 			v = v + (Sp.w * P.dt) * tang;
 		}
 	}
+	// damping applied to velocity-like displacement
 	v = v * D.factor;
-	p = p + v * P.dt;
-	posOut.data[i] = vec4<f32>(p, radiate_mag);
-	velOut.data[i] = vec4<f32>(v, 0.0);
+	// Verlet-like position update: newPos = p + v*dt  (equivalent to p + (p - prev) + a*dt*dt if prev was set appropriately)
+	// Using the computed v keeps behavior close to original while removing explicit vel buffers.
+	let newP = p + v * P.dt;
+	posOut.data[i] = vec4<f32>(newP, radiate_mag);
+	// write previous position for the next frame (prevOut := current position)
+	prevPosOut.data[i] = vec4<f32>(p, 0.0);
 }

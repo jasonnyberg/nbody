@@ -153,16 +153,16 @@ This document lists every GPU buffer allocated by `nbody5debug.html`, its intend
   - Shader bindings:
     - `integrateBH.wgsl` @binding(9) Sp: Spin (uniform)
 
-- `velA`, `velB` (double-buffered particle velocities)
+- `prevPosA`, `prevPosB` (double-buffered previous positions used for Verlet)
   - Allocated:
-    - `velA` := `bufFrom(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST)`
-    - `velB` := `makeBuf(stateBytes, GPUBufferUsage.STORAGE)`
-  - Purpose: Particle velocities (vec4<f32>) double-buffered for integration.
+    - `prevPosA` := `bufFrom(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC)`
+    - `prevPosB` := `makeBuf(stateBytes, GPUBufferUsage.STORAGE)`
+  - Purpose: Store particle positions from the previous timestep. Velocities are computed on-the-fly in shaders as (pos - prevPos)/dt using Verlet integration; explicit velocity buffers are removed.
   - Shader bindings:
-    - `integrateBH.wgsl` @binding(1) velIn (storage, read)
-    - `integrateBH.wgsl` @binding(3) velOut (storage, read_write)
-    - `detectMorton.wgsl` @binding(1) Pvel (storage, read)
-    - `split.wgsl` @binding(0) V: Vec4Buf (storage, read_write)
+    - `integrateBH.wgsl` @binding(1) prevPos (storage, read)
+    - `integrateBH.wgsl` @binding(3) prevPosOut (storage, read_write) — when writing previous positions for the next step
+    - `detectMorton.wgsl` @binding(1) Pprev: Vec4Buf (storage, read)
+    - `split.wgsl` @binding(1) prevPos: Vec4Buf (storage, read)
 
 - `visPairBuf` (Visualization pair buffer)
   - Allocated: `device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })`
@@ -184,11 +184,20 @@ This document lists every GPU buffer allocated by `nbody5debug.html`, its intend
 
 Below are tables indexed by shader filename. Each table lists the group-0 bindings (binding number → buffer name and usage in the shader) as seen in the WGSL files under `scripts/*.wgsl`.
 
-### scripts/integrateBH.wgsl (compute)
+-### scripts/integrateBH.wgsl (compute)
 - @binding(0) posIn : Vec4Buf (storage, read) → `posA` or `posB` depending on phase
-- @binding(1) velIn : Vec4Buf (storage, read) → `velA` or `velB`
+- @binding(1) prevPosIn : Vec4Buf (storage, read) → `prevPosA` or `prevPosB`
 - @binding(2) posOut: Vec4Buf (storage, read_write) → `posB` or `posA`
-- @binding(3) velOut: Vec4Buf (storage, read_write) → `velB` or `velA`
+- @binding(3) prevPosOut: Vec4Buf (storage, read_write) → `prevPosB` or `prevPosA` (writes previous positions for next step)
+- @binding(4) P: SimParams (uniform) → `simParamsBuf`
+ - @binding(5) M: FloatBuf (storage, read) → `masses`
+ - @binding(6) D: Damp (uniform) → `dampBuf`
+ - @binding(7) Rp: Repulse (uniform) → `repulseBuf`
+ - @binding(8) Rd: Rad (uniform) → `radBuf`
+ - @binding(9) Sp: Spin (uniform) → `spinBuf`
+ - @binding(10) B: BH (uniform) → `bhBuf`
+ - @binding(11) idx: Keys (storage, read) → `mortonIdx`
+ - @binding(12) C: Cl (uniform) → `clBuf`
 - @binding(4) P: SimParams (uniform) → `simParamsBuf`
 - @binding(5) M: FloatBuf (storage, read) → `masses`
 - @binding(6) D: Damp (uniform) → `dampBuf`
@@ -230,20 +239,21 @@ Below are tables indexed by shader filename. Each table lists the group-0 bindin
 - @binding(2) U: Mats (uniform) → `matsBuf`
 
 ### scripts/split.wgsl (compute)
-- @binding(0) V: Vec4Buf (storage, read_write) → `velA` or `velB`
-- @binding(1) M: FloatBuf (storage, read) → `masses`
-- @binding(2) pc: PairCount (storage, read_write) → `pairCount`
-- @binding(3) pb: Pairs (storage, read) → `pairBuf`
-- @binding(4) R: Rest (uniform) → `restBuf`
-- @binding(5) L: Locks (storage, read_write) → `locks`
-- @binding(6) C: Claims (storage, read_write) → `claims`
+- @binding(0) Ppos: Vec4Buf (storage, read) → `posA` or `posB`
+- @binding(1) prevPos: Vec4Buf (storage, read) → `prevPosA` or `prevPosB`
+- @binding(2) M: FloatBuf (storage, read) → `masses`
+- @binding(3) pc: PairCount (storage, read_write) → `pairCount`
+- @binding(4) pb: Pairs (storage, read) → `pairBuf`
+- @binding(5) R: Rest (uniform) → `restBuf`
+- @binding(6) L: Locks (storage, read_write) → `locks`
+- @binding(7) C: Claims (storage, read_write) → `claims`
 
 ### scripts/detectPairs.wgsl (not used in this build)
 - Legacy; skip listing.
 
 ### scripts/detectMorton.wgsl (compute)
 - @binding(0) Ppos: Vec4Buf (storage, read) → `posA` or `posB`
-- @binding(1) Pvel: Vec4Buf (storage, read) → `velA` or `velB`
+- @binding(1) Pprev: Vec4Buf (storage, read) → `prevPosA` or `prevPosB` (used to compute velocities on-the-fly)
 - @binding(2) M: FloatBuf (storage, read) → `masses`
 - @binding(3) S: SimParams (uniform) → `simParamsBuf`
 - @binding(4) pc: PairCount (storage, read_write) → `pairCount`
@@ -262,7 +272,7 @@ Below are tables indexed by shader filename. Each table lists the group-0 bindin
 ---
 
 ## Notes and mapping caveats
-- `posA/posB` and `velA/velB` are double-buffered; the producer/consumer roles swap each integration step. When seeing a WGSL binding named `posIn/posOut` or `velIn/velOut`, the HTML code chooses `posA`/`posB` or vice-versa depending on which buffer is the current source.
+- `posA/posB` and `prevPosA/prevPosB` are double-buffered; the producer/consumer roles swap each integration step. When seeing a WGSL binding named `posIn/posOut` or `prevPosIn/prevPosOut`, the HTML code chooses `posA`/`posB` or vice-versa depending on which buffer is the current source.
 - The `lines` pipeline reads `outPairCount` (@binding(3)) to determine how many pairs were emitted by `integrateBH`. However, the render pass in `nbody5debug.html` draws `MAX_PAIRS` instances unconditionally; the shader uses the atomic pair count to avoid rendering garbage (the WGSL code bounds an index against the atomic value).
 - There are several small CPU readback buffers used only for developer debugging (`pairBufReadback`, `pairCountReadback`, `posReadback`). These are COPY_DST / MAP_READ only and are not bound to shaders.
 - The explicit `integrateBH` and `lines` bind group layouts in `nbody5debug.html` were added to match the more-than-default storage buffer usage in the `integrateBH` shader. Other pipelines use `layout: 'auto'` and rely on the implementation to infer layouts that match the WGSL `@binding` declarations.

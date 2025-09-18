@@ -77,9 +77,7 @@
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }) || await navigator.gpu.requestAdapter();
     if (!adapter) { alert('No GPU adapter'); return; }
     // Some devices support more storage buffers per stage than the default (8).
-    // The integrateBH shader uses 10 storage buffers; prefer requesting that limit
-    // if the adapter advertises support. Fall back to a normal requestDevice() if
-    // the adapter won't grant the higher limit.
+    // Relaxed: if not granted, continue with defaults.
     const DESIRED_MAX_STORAGE = 10;
     let device;
     try {
@@ -87,11 +85,9 @@
       if (typeof adapterMax === 'number' && adapterMax >= DESIRED_MAX_STORAGE) {
         device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: DESIRED_MAX_STORAGE } });
       } else {
-        // Try requesting the higher limit anyway; some implementations allow it even if not advertised.
         try {
           device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: DESIRED_MAX_STORAGE } });
         } catch (e) {
-          // Fallback to default device if the higher limit is not granted.
           console.warn('Could not obtain higher storage buffer limit, falling back to default device:', e);
           device = await adapter.requestDevice();
         }
@@ -102,19 +98,9 @@
       return;
     }
 
-    // Verify the actual device limits meet our shader requirements. If not,
-    // abort early with a clear message to avoid creating invalid pipelines.
-    const deviceMaxStorage = (device.limits && device.limits.maxStorageBuffersPerShaderStage) || 8;
-    if (deviceMaxStorage < DESIRED_MAX_STORAGE) {
-      const msg = `Device supports maxStorageBuffersPerShaderStage=${deviceMaxStorage}, but the simulation needs ${DESIRED_MAX_STORAGE}. Try a different adapter or allow higher limits.`;
-      console.error(msg);
-      alert(msg);
-      return;
-    }
     const context = canvas.getContext('webgpu');
     const format = navigator.gpu.getPreferredCanvasFormat();
-    const WG_SIZE = 128; // tuned workgroup size
-    const MORTON_BITS = 10; // 10 bits/axis => 1024^3 grid
+    const WG_SIZE = 64; // small workgroup for debug
 
     function resize() {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -128,17 +114,17 @@
     // Simple parameters/UI
     let G = 3.30;
     let dt = 0.50;
-    let restitution = 1.00; // used as alpha in energy restitution
-    let radiusFactor = 2.0; // new: scales collision radii
-    let R = 10.0;           // new: short-range repulsion strength (like nbody3)
-    let spin = 0.00;        // new: tangential velocity injection rate (rad/s)
-    let damping = 1.00;     // CHANGED: damping factor (0..1), applied directly to velocity (1.0 = no damping)
-    let radiativeDamping = 0.005; // new: radiative damping coefficient
-  let collisionsEnabled = true; // collisions always enabled in this simplified build
+    let restitution = 1.00;
+    let radiusFactor = 2.0;
+    let R = 10.0;
+    let spin = 0.00;
+    let damping = 1.00;
+    let radiativeDamping = 0.005;
+    let collisionsEnabled = true; // collisions always enabled in this simplified build
     let collideEvery = 1;         // new: run collisions every k frames
-  let useMorton = true;         // morton/octree always used
+    let useMorton = true;         // morton/octree always used
     let neighborWindow = 64;      // new: neighbors to scan on each side in Morton order
-  let useBH = true;             // Barnes–Hut always used
+    let useBH = true;             // Barnes–Hut always used
     let theta = 0.60;             // new: BH opening angle
     let clusterSize = 64;         // new: leaf capacity approximation
 
@@ -226,6 +212,7 @@
 
     // Orbit camera (simple)
     let az = 0.3, el = 0.6, dist = 2000.0;
+    let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
     function updateView() {
       const ce = Math.cos(el), se = Math.sin(el), sa = Math.sin(az), ca = Math.cos(az);
       const eye = [ dist * ce * sa, dist * se, dist * ce * ca ];
@@ -246,7 +233,7 @@
     })();
 
     // Simulation setup (simple random sphere)
-    const particleCount = 32; // keep moderate (O(N^2) pair find)
+    const particleCount = 32; // keep moderate
     const stride = 4; // vec4
     const stateBytes = particleCount * stride * 4;
 
@@ -258,46 +245,32 @@
     }
 
     const posInit = new Float32Array(particleCount * stride);
-    const velInit = new Float32Array(particleCount * stride);
     const massInit = new Float32Array(particleCount);
     const rad = 800.0;
     for (let i=0;i<particleCount;i++){
       let x,y,z; do { x=(Math.random()*2-1)*rad; y=(Math.random()*2-1)*rad; z=(Math.random()*2-1)*rad; } while (x*x+y*y+z*z>rad*rad);
       const o=i*stride; posInit[o]=x; posInit[o+1]=y; posInit[o+2]=z; posInit[o+3]=0;
-      velInit[o]=0; velInit[o+1]=0; velInit[o+2]=0; velInit[o+3]=0;
-      massInit[i]=1.0; // start uniform
+      massInit[i]=1.0;
     }
-  let posA = bufFrom(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-  let posB = makeBuf(stateBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    let velA = bufFrom(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-    let velB = makeBuf(stateBytes, GPUBufferUsage.STORAGE);
+    let posA = bufFrom(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+    let posB = makeBuf(stateBytes, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    // Verlet previous positions
+    let prevPosA = bufFrom(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+    let prevPosB = makeBuf(stateBytes, GPUBufferUsage.STORAGE);
     const masses = bufFrom(massInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
 
-    // Collision pair buffers (very simple)
-    const MAX_PAIRS = Math.min(particleCount * 8, 262144);
-  const pairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-  const pairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  // Outgoing visualization pairs written by integrateBH (particle-particle and particle-cluster COM)
-  const outPairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
-  const outPairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-  // Visualization-only pair buffer (CPU-writable) to avoid mutating the simulation pairBuf
-  const visPairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  // Small persistent readback buffer for debugging pairCount
-  const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-  // Small persistent readback buffer for the first few pair entries (64 entries = 64 * 16 bytes)
-  const DUMP_PAIRS_N = 64;
-  const pairBufReadback = device.createBuffer({ size: DUMP_PAIRS_N * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-  // Small persistent readback buffer for the first particle position (vec4<f32> = 16 bytes)
-  const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-  const locks = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  const claims = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-  // Morton keys + index buffers
-    const mortonKeys = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const mortonIdx  = device.createBuffer({ size: particleCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    // Pair visualization buffers (CPU generated)
+    const MAX_PAIRS = (particleCount * (particleCount - 1)) >> 1;
+    const visPairBuf = device.createBuffer({ size: MAX_PAIRS * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const outPairCount = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    // Readback helpers for dump
+    const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const DUMP_PAIRS_N = 64;
+    const pairBufReadback = device.createBuffer({ size: DUMP_PAIRS_N * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
     // Uniforms
-    // SimParams is 4 floats (16 bytes): dt, G, eps, num
-    const simParams = new Float32Array([dt, G, 1.0, particleCount]); // eps defaults to 1.0
+    const simParams = new Float32Array([dt, G, 4.0, particleCount]); // eps defaults to 4.0
     const simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeSimParams(){ device.queue.writeBuffer(simParamsBuf, 0, simParams.buffer, simParams.byteOffset, simParams.byteLength); }
     writeSimParams();
@@ -307,124 +280,62 @@
     function writeRest(){ restParams[0]=restitution; device.queue.writeBuffer(restBuf, 0, restParams); }
     writeRest();
 
-  // New: collision radius factor + approach flag uniform (rf, approach, pad, pad)
-  // approach: 1.0 => only approaching pairs; 0.0 => all proximal pairs
-  const radiusParams = new Float32Array([radiusFactor, 1.0, 0, 0]);
-  const radiusBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  function writeRadius(){ radiusParams[0]=radiusFactor; device.queue.writeBuffer(radiusBuf, 0, radiusParams); }
-  writeRadius();
+    const radiusParams = new Float32Array([radiusFactor, 1.0, 0, 0]);
+    const radiusBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRadius(){ radiusParams[0]=radiusFactor; device.queue.writeBuffer(radiusBuf, 0, radiusParams); }
+    writeRadius();
 
-  // Approach-only checkbox wiring (debug helper) — radiusParams/radiusBuf are available here
-  const approachEl = document.getElementById('approach');
-  approachEl.addEventListener('input', () => {
-    const v = approachEl.checked ? 1.0 : 0.0;
-    radiusParams[1] = v; // second float in radiusParams is approach
+    const approachEl = document.getElementById('approach');
+    approachEl.addEventListener('input', () => {
+      const v = approachEl.checked ? 1.0 : 0.0;
+      radiusParams[1] = v; device.queue.writeBuffer(radiusBuf, 0, radiusParams);
+    });
+    radiusParams[1] = approachEl.checked ? 1.0 : 0.0;
     device.queue.writeBuffer(radiusBuf, 0, radiusParams);
-  });
-  // initialize approach uniform from checkbox
-  radiusParams[1] = approachEl.checked ? 1.0 : 0.0;
-  device.queue.writeBuffer(radiusBuf, 0, radiusParams);
-  // Expose helper for console toggling
-  window.setApproachOnly = (on) => { approachEl.checked = !!on; approachEl.dispatchEvent(new Event('input')); };
+    window.setApproachOnly = (on) => { approachEl.checked = !!on; approachEl.dispatchEvent(new Event('input')); };
 
-  // Dump pairs button handler (one-shot readback)
-  const dumpBtn = document.getElementById('dumpPairs');
-  dumpBtn.addEventListener('click', async () => {
-    try {
-      // Copy current pairCount and first DUMP_PAIRS_N pairs into readback buffers
-      const dbgEnc = device.createCommandEncoder();
-      dbgEnc.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
-      dbgEnc.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, DUMP_PAIRS_N * 16);
-      device.queue.submit([dbgEnc.finish()]);
-      await pairCountReadback.mapAsync(GPUMapMode.READ);
-      await pairBufReadback.mapAsync(GPUMapMode.READ);
-      const cnt = new Uint32Array(pairCountReadback.getMappedRange())[0];
-      const pairs = new Uint32Array(pairBufReadback.getMappedRange());
-      const out = [];
-      const m = Math.min(DUMP_PAIRS_N, cnt);
-      for (let i=0;i<m;i++) out.push([pairs[i*4+0], pairs[i*4+1], pairs[i*4+2], pairs[i*4+3]]);
-      console.log('Dump pairs:', cnt, out);
-      pairCountReadback.unmap(); pairBufReadback.unmap();
-    } catch (e) { console.warn('dump pairs failed', e); }
-  });
+    const dumpBtn = document.getElementById('dumpPairs');
+    dumpBtn.addEventListener('click', async () => {
+      try {
+        const dbgEnc = device.createCommandEncoder();
+        dbgEnc.copyBufferToBuffer(outPairCount, 0, pairCountReadback, 0, 4);
+        dbgEnc.copyBufferToBuffer(visPairBuf, 0, pairBufReadback, 0, DUMP_PAIRS_N * 16);
+        device.queue.submit([dbgEnc.finish()]);
+        await pairCountReadback.mapAsync(GPUMapMode.READ);
+        await pairBufReadback.mapAsync(GPUMapMode.READ);
+        const cnt = new Uint32Array(pairCountReadback.getMappedRange())[0];
+        const pairs = new Uint32Array(pairBufReadback.getMappedRange());
+        const out = [];
+        const m = Math.min(DUMP_PAIRS_N, cnt);
+        for (let i=0;i<m;i++) out.push([pairs[i*4+0], pairs[i*4+1], pairs[i*4+2], pairs[i*4+3]]);
+        console.log('Dump pairs:', cnt, out);
+        pairCountReadback.unmap(); pairBufReadback.unmap();
+      } catch (e) { console.warn('dump pairs failed', e); }
+    });
 
-    // New: damping uniform
     const dampParams = new Float32Array([damping, 0,0,0]);
     const dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeDamp(){ dampParams[0]=damping; device.queue.writeBuffer(dampBuf, 0, dampParams); }
     writeDamp();
 
-    // New: spin uniform
     const spinParams = new Float32Array([spin, 0,0,0]);
     const spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeSpin(){ spinParams[0]=spin; device.queue.writeBuffer(spinBuf, 0, spinParams); }
     writeSpin();
 
-    // New: repulsion (R) uniform
     const repulseParams = new Float32Array([R, 0,0,0]);
     const repulseBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeRepulse(){ repulseParams[0]=R; device.queue.writeBuffer(repulseBuf, 0, repulseParams); }
     writeRepulse();
 
-    // New: radiative damping uniform
     const radParams = new Float32Array([radiativeDamping, 0,0,0]);
     const radBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeRad(){ radParams[0]=radiativeDamping; device.queue.writeBuffer(radBuf, 0, radParams); }
     writeRad();
 
-    // New: Morton/octree uniforms (extent maps [-extent,extent] to [0,1])
-    let mortonExtent = 4096.0;
-    const mortonParams = new Float32Array([mortonExtent, 0,0,0]);
-    const mortonParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeMorton(){ mortonParams[0]=mortonExtent; device.queue.writeBuffer(mortonParamsBuf, 0, mortonParams); }
-    writeMorton();
-
-    // Bitonic sort stage params (j,k,n)
-    const sortParams = new Uint32Array([0, 0, particleCount, 0]);
-    const sortParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeSortJK(j, k){ sortParams[0] = j; sortParams[1] = k; device.queue.writeBuffer(sortParamsBuf, 0, sortParams); }
-
-    // Neighbor window uniform for Morton collision detection
-    const windowParams = new Uint32Array([neighborWindow, 0, 0, 0]);
-    const windowBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeWindow(){ windowParams[0] = neighborWindow; device.queue.writeBuffer(windowBuf, 0, windowParams); }
-    writeWindow();
-
-    // New: BH uniforms and cluster buffers
-    const bhParams = new Float32Array([theta, 0,0,0]);
-    const bhBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    // Cluster params: size, count
-    let clusterCountUsed = Math.ceil(particleCount / clusterSize);
-    const clParams = new Uint32Array([clusterSize, clusterCountUsed, 0, 0]);
-    const clBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeBHParams(){
-      bhParams[0] = theta; device.queue.writeBuffer(bhBuf, 0, bhParams);
-      clusterCountUsed = Math.ceil(particleCount / Math.max(1, clusterSize));
-      clParams[0] = clusterSize; clParams[1] = clusterCountUsed;
-      device.queue.writeBuffer(clBuf, 0, clParams);
-    }
-    writeBHParams();
-    // Allocate max cluster buffers for min leaf size 16
-    const MIN_CLUSTER = 16;
-    const maxClusters = Math.ceil(particleCount / MIN_CLUSTER);
-    const clMassBuf = device.createBuffer({ size: maxClusters * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const clComBuf  = device.createBuffer({ size: maxClusters * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-
-    // WGSL Shaders
-    // Load all WGSL shaders from external files
-  // integrate.wgsl and detectPairs.wgsl removed; using integrateBH and detectMorton
-    const splitWGSL = await (await fetch('scripts/split.wgsl')).text();
-    const renderWGSL = await (await fetch('scripts/render.wgsl')).text();
-    const mortonWGSL = await (await fetch('scripts/morton.wgsl')).text();
-    const bitonicWGSL = await (await fetch('scripts/bitonic.wgsl')).text();
-    const detectMortonWGSL = await (await fetch('scripts/detectMorton.wgsl')).text();
-    const clusterReduceWGSL = await (await fetch('scripts/clusterReduce.wgsl')).text();
-    const integrateBHWGSL = await (await fetch('scripts/integrateBH.wgsl')).text();
-
     // Matrices + viewport params in a 10-vec4 uniform for alignment
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
-    let view = lookAt([0, 0, dist], [0,0,0], [0,1,0]);
-    const mats = new Float32Array(40); // 10 * vec4
+    const mats = new Float32Array(36); // proj(16) + view(16) + vp(vec4)
     const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeMats() {
       proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
@@ -434,16 +345,113 @@
       mats[32] = canvas.width;  // viewport W
       mats[33] = canvas.height; // viewport H
       mats[34] = 18.0;          // sprite sizeScale in pixels
-      mats[35] = 1.0 / Math.log(1.0 + 8.0); // inverse log(maxMass+1)
+      mats[35] = 0.0;           // padding/unused
       device.queue.writeBuffer(matsBuf, 0, mats);
     }
     writeMats();
 
-    // Pipelines (compute + render)
-  // Direct integrate/detect pipelines removed; using Morton + Barnes–Hut paths only
-    const splitModule = device.createShaderModule({ code: splitWGSL });
-    const splitPipe = device.createComputePipeline({ layout: 'auto', compute: { module: splitModule, entryPoint: 'main' } });
+    // WGSL Shaders (inline)
+    const renderWGSL = /* wgsl */`
+struct VSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec4f,
+};
+@group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
+@group(0) @binding(1) var<storage, read> massBuf: array<f32>;
+struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
+@group(0) @binding(2) var<uniform> ubo: UBO;
 
+fn getCorner(i: u32) -> vec2f {
+  return select(vec2f(-1.0, -1.0), select(vec2f(1.0, -1.0), select(vec2f(-1.0, 1.0), vec2f(1.0,1.0), i==3u), i==2u), i==1u);
+}
+
+@vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
+  let P = posBuf[iid];
+  let mass = massBuf[iid];
+  let vp4 = ubo.proj * ubo.view * vec4f(P.xyz, 1.0);
+  let w = ubo.vp.x;
+  let h = ubo.vp.y;
+  let baseSize = ubo.vp.z;
+  let sizePx = baseSize * pow(max(mass, 1.0), 0.3333);
+  let offs = getCorner(vid);
+  let offsClip = vec2f(2.0 * sizePx / w, 2.0 * sizePx / h) * offs;
+  var o: VSOut;
+  o.pos = vec4f(vp4.xy + offsClip * vp4.w, vp4.z, vp4.w);
+  o.color = vec4f(0.2, 1.0, 1.0, 0.9);
+  return o;
+}
+
+@fragment fn fs(inp: VSOut) -> @location(0) vec4f {
+  return inp.color;
+}
+`;
+
+    const linesWGSL = /* wgsl */`
+struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
+@group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
+@group(0) @binding(1) var<storage, read> pairs: array<vec4u>;
+struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
+@group(0) @binding(2) var<uniform> ubo: UBO;
+@group(0) @binding(3) var<storage, read> pairCountBuf: array<u32>; // [0] = count
+
+fn projView(p: vec3f) -> vec4f {
+  return ubo.proj * ubo.view * vec4f(p, 1.0);
+}
+
+@vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
+  let count = pairCountBuf[0];
+  var o: VSOut;
+  if (iid >= count) {
+    o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+    o.col = vec4f(0.0);
+    return o;
+  }
+  let pr = pairs[iid];
+  let i = pr.x; let j = pr.y;
+  let a = posBuf[i].xyz;
+  let b = posBuf[j].xyz;
+  let col = vec3f(1.0, 0.6, 0.1);
+  let P = select(a, b, vid == 1u);
+  o.pos = projView(P);
+  o.col = vec4f(col, 0.9);
+  return o;
+}
+
+@fragment fn fs(inp: VSOut) -> @location(0) vec4f { return inp.col; }
+`;
+
+    const integrateWGSL = /* wgsl */`
+struct Sim { dt: f32, G: f32, eps: f32, n: f32 };
+@group(0) @binding(0) var<storage, read> posIn: array<vec4f>;
+@group(0) @binding(1) var<storage, read> prevIn: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> posOut: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> prevOut: array<vec4f>;
+@group(0) @binding(4) var<uniform> sim: Sim;
+@group(0) @binding(5) var<storage, read> masses: array<f32>;
+@group(0) @binding(6) var<uniform> dampU: vec4f;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  let N = u32(sim.n);
+  if (i >= N) { return; }
+  let Pi = posIn[i].xyz;
+  var a = vec3f(0.0);
+  for (var j: u32 = 0u; j < N; j++) {
+    if (j == i) { continue; }
+    let r = posIn[j].xyz - Pi;
+    let d2 = max(dot(r, r), sim.eps * sim.eps);
+    let inv = inverseSqrt(d2 * d2 * d2);
+    a += (sim.G * masses[j]) * r * inv;
+  }
+  let dt2 = sim.dt * sim.dt;
+  let next = Pi + (Pi - prevIn[i].xyz) * dampU.x + a * dt2;
+  prevOut[i] = vec4f(Pi, 0.0);
+  posOut[i] = vec4f(next, 0.0);
+}
+`;
+
+    // Pipelines
     const renderModule = device.createShaderModule({ code: renderWGSL });
     const renderPipe = device.createRenderPipeline({
       layout: 'auto',
@@ -452,187 +460,18 @@
       primitive: { topology: 'triangle-strip', cullMode: 'none' }
     });
 
-    // Pipelines for Morton + sort
-    const mortonModule = device.createShaderModule({ code: mortonWGSL });
-    const mortonPipe = device.createComputePipeline({ layout: 'auto', compute: { module: mortonModule, entryPoint: 'main' } });
-    const bitonicModule = device.createShaderModule({ code: bitonicWGSL });
-    const bitonicPipe = device.createComputePipeline({ layout: 'auto', compute: { module: bitonicModule, entryPoint: 'main' } });
-    const detectMortonModule = device.createShaderModule({ code: detectMortonWGSL });
-    const detectMortonPipe = device.createComputePipeline({ layout: 'auto', compute: { module: detectMortonModule, entryPoint: 'main' } });
-
-    // New: cluster reduce and BH integrate shaders
-    const clusterReduceModule = device.createShaderModule({ code: clusterReduceWGSL });
-    const clusterReducePipe = device.createComputePipeline({ layout: 'auto', compute: { module: clusterReduceModule, entryPoint: 'main' } });
-
-    const integrateBHModule = device.createShaderModule({ code: integrateBHWGSL });
-    // Explicit bind group layout for integrateBH (group 0) to match WGSL bindings 0..16
-    const integrateBHBindGroupLayout = device.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage', minBindingSize: 16 } }, // posIn (read)
-      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage', minBindingSize: 16 } }, // velIn (read)
-      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage', minBindingSize: 16 } }, // posOut (read_write)
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage', minBindingSize: 16 } }, // velOut (read_write)
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // SimParams
-      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage', minBindingSize: 4 } }, // masses (read)
-      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // Damp
-      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // Repulse
-      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // Rad
-      { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // Spin
-      { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // BH
-      { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage', minBindingSize: 4 } }, // idx
-      { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 16 } }, // Cl
-      { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage', minBindingSize: 4 } }, // ClMass
-      { binding: 14, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage', minBindingSize: 16 } }, // ClCom
-      { binding: 15, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage', minBindingSize: 16 } }, // outPairs (read_write)
-      { binding: 16, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage', minBindingSize: 4 } }, // outPairCount (read_write atomic)
-    ]});
-    const integrateBHPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [integrateBHBindGroupLayout] });
-    const integrateBHPipe = device.createComputePipeline({ layout: integrateBHPipelineLayout, compute: { module: integrateBHModule, entryPoint: 'main' } });
-
-    // Lines pipeline (GPU render of pair vectors)
-    const linesWGSL = await (await fetch('scripts/lines.wgsl')).text();
     const linesModule = device.createShaderModule({ code: linesWGSL });
-    // Explicit bind group layout for lines (group 0) to match WGSL bindings 0..4
-    const linesBindGroupLayout = device.createBindGroupLayout({ entries: [
-      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage', minBindingSize: 16 } },
-      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage', minBindingSize: 16 } },
-      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 160 } },
-      { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage', minBindingSize: 4 } },
-      { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage', minBindingSize: 16 } },
-    ]});
-    const linesPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [linesBindGroupLayout] });
     const linesPipe = device.createRenderPipeline({
-      layout: linesPipelineLayout,
+      layout: 'auto',
       vertex: { module: linesModule, entryPoint: 'vs' },
       fragment: { module: linesModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
-      primitive: { topology: 'line-list', stripIndexFormat: undefined, cullMode: 'none' }
+      primitive: { topology: 'line-list', cullMode: 'none' }
     });
 
-    // Bind groups for Morton
-    const mortonBG_posA = device.createBindGroup({ layout: mortonPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: mortonKeys } },
-      { binding: 2, resource: { buffer: mortonIdx } },
-      { binding: 3, resource: { buffer: simParamsBuf } },
-      { binding: 4, resource: { buffer: mortonParamsBuf } },
-    ]});
-    const mortonBG_posB = device.createBindGroup({ layout: mortonPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: mortonKeys } },
-      { binding: 2, resource: { buffer: mortonIdx } },
-      { binding: 3, resource: { buffer: simParamsBuf } },
-      { binding: 4, resource: { buffer: mortonParamsBuf } },
-    ]});
+    const integrateModule = device.createShaderModule({ code: integrateWGSL });
+    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
 
-    const bitonicBG = device.createBindGroup({ layout: bitonicPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: mortonKeys } },
-      { binding: 1, resource: { buffer: mortonIdx } },
-      { binding: 2, resource: { buffer: sortParamsBuf } },
-    ]});
-
-    const detectMortonBG_posA = device.createBindGroup({ layout: detectMortonPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: velA } },
-      { binding: 2, resource: { buffer: masses } },
-      { binding: 3, resource: { buffer: simParamsBuf } },
-      { binding: 4, resource: { buffer: pairCount } },
-      { binding: 5, resource: { buffer: pairBuf } },
-      { binding: 6, resource: { buffer: radiusBuf } },
-      { binding: 7, resource: { buffer: mortonIdx } },
-      { binding: 8, resource: { buffer: windowBuf } },
-    ]});
-    const detectMortonBG_posB = device.createBindGroup({ layout: detectMortonPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: velB } },
-      { binding: 2, resource: { buffer: masses } },
-      { binding: 3, resource: { buffer: simParamsBuf } },
-      { binding: 4, resource: { buffer: pairCount } },
-      { binding: 5, resource: { buffer: pairBuf } },
-      { binding: 6, resource: { buffer: radiusBuf } },
-      { binding: 7, resource: { buffer: mortonIdx } },
-      { binding: 8, resource: { buffer: windowBuf } },
-    ]});
-
-    // Bind groups for cluster reduce (posA/posB)
-    const clusterReduceBG_posA = device.createBindGroup({ layout: clusterReducePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: masses } },
-      { binding: 2, resource: { buffer: mortonIdx } },
-      { binding: 3, resource: { buffer: clBuf } },
-      { binding: 4, resource: { buffer: clMassBuf } },
-      { binding: 5, resource: { buffer: clComBuf } },
-      { binding: 6, resource: { buffer: simParamsBuf } },
-    ]});
-    const clusterReduceBG_posB = device.createBindGroup({ layout: clusterReducePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: masses } },
-      { binding: 2, resource: { buffer: mortonIdx } },
-      { binding: 3, resource: { buffer: clBuf } },
-      { binding: 4, resource: { buffer: clMassBuf } },
-      { binding: 5, resource: { buffer: clComBuf } },
-      { binding: 6, resource: { buffer: simParamsBuf } },
-    ]});
-
-    // Bind groups for integrateBH (A->B and B->A)
-    const integrateBHBG_AtoB = device.createBindGroup({ layout: integrateBHPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: velA } },
-      { binding: 2, resource: { buffer: posB } },
-      { binding: 3, resource: { buffer: velB } },
-      { binding: 4, resource: { buffer: simParamsBuf } },
-      { binding: 5, resource: { buffer: masses } },
-      { binding: 6, resource: { buffer: dampBuf } },
-      { binding: 7, resource: { buffer: repulseBuf } },
-      { binding: 8, resource: { buffer: radBuf } },
-      { binding: 9, resource: { buffer: spinBuf } },
-      { binding: 10, resource: { buffer: bhBuf } },
-      { binding: 11, resource: { buffer: mortonIdx } },
-      { binding: 12, resource: { buffer: clBuf } },
-      { binding: 13, resource: { buffer: clMassBuf } },
-      { binding: 14, resource: { buffer: clComBuf } },
-      { binding: 15, resource: { buffer: outPairBuf } },
-      { binding: 16, resource: { buffer: outPairCount } },
-    ]});
-    const integrateBHBG_BtoA = device.createBindGroup({ layout: integrateBHPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: velB } },
-      { binding: 2, resource: { buffer: posA } },
-      { binding: 3, resource: { buffer: velA } },
-      { binding: 4, resource: { buffer: simParamsBuf } },
-      { binding: 5, resource: { buffer: masses } },
-      { binding: 6, resource: { buffer: dampBuf } },
-      { binding: 7, resource: { buffer: repulseBuf } },
-      { binding: 8, resource: { buffer: radBuf } },
-      { binding: 9, resource: { buffer: spinBuf } },
-      { binding: 10, resource: { buffer: bhBuf } },
-      { binding: 11, resource: { buffer: mortonIdx } },
-      { binding: 12, resource: { buffer: clBuf } },
-      { binding: 13, resource: { buffer: clMassBuf } },
-      { binding: 14, resource: { buffer: clComBuf } },
-      { binding: 15, resource: { buffer: outPairBuf } },
-      { binding: 16, resource: { buffer: outPairCount } },
-    ]});
-
-    // Compute bind groups for direct integrate/detect removed (using BH + Morton paths)
-
-    const splitBG_velA = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: velA } },
-      { binding: 1, resource: { buffer: masses } },
-      { binding: 2, resource: { buffer: pairCount } },
-      { binding: 3, resource: { buffer: pairBuf } },
-      { binding: 4, resource: { buffer: restBuf } },
-      { binding: 5, resource: { buffer: locks } },
-      { binding: 6, resource: { buffer: claims } },
-    ]});
-    const splitBG_velB = device.createBindGroup({ layout: splitPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: velB } },
-      { binding: 1, resource: { buffer: masses } },
-      { binding: 2, resource: { buffer: pairCount } },
-      { binding: 3, resource: { buffer: pairBuf } },
-      { binding: 4, resource: { buffer: restBuf } },
-      { binding: 5, resource: { buffer: locks } },
-      { binding: 6, resource: { buffer: claims } },
-    ]});
-
+    // Bind groups
     const renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posA } },
       { binding: 1, resource: { buffer: masses } },
@@ -644,178 +483,96 @@
       { binding: 2, resource: { buffer: matsBuf } },
     ]});
 
-    // Lines bind groups (posA/posB)
     const linesBG_posA = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posA } },
       { binding: 1, resource: { buffer: visPairBuf } },
       { binding: 2, resource: { buffer: matsBuf } },
       { binding: 3, resource: { buffer: outPairCount } },
-      { binding: 4, resource: { buffer: clComBuf } },
     ]});
     const linesBG_posB = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: posB } },
       { binding: 1, resource: { buffer: visPairBuf } },
       { binding: 2, resource: { buffer: matsBuf } },
       { binding: 3, resource: { buffer: outPairCount } },
-      { binding: 4, resource: { buffer: clComBuf } },
     ]});
 
-    // Removed separate spin bind groups (spin is applied in integrate)
+    const integrateBG_AtoB = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: prevPosA } },
+      { binding: 2, resource: { buffer: posB } },
+      { binding: 3, resource: { buffer: prevPosB } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+    ]});
+    const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: prevPosB } },
+      { binding: 2, resource: { buffer: posA } },
+      { binding: 3, resource: { buffer: prevPosA } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+    ]});
+
+    // Precompute all unique pairs (i<j) once
+    const allPairs = new Uint32Array(MAX_PAIRS * 4);
+    let pIdx = 0;
+    for (let i=0; i<particleCount; i++) {
+      for (let j=i+1; j<particleCount; j++) {
+        const o = pIdx * 4;
+        allPairs[o+0] = i;
+        allPairs[o+1] = j;
+        allPairs[o+2] = 0;
+        allPairs[o+3] = 0;
+        pIdx++;
+      }
+    }
+    device.queue.writeBuffer(visPairBuf, 0, allPairs);
+    device.queue.writeBuffer(outPairCount, 0, new Uint32Array([pIdx]));
 
     // Frame loop
     let readFromA = true;
     let lastT = performance.now();
-    let frameCount = 0;
-    // Debug: always populate pairBuf with all unique pairs (i<j) up to MAX_PAIRS
-    // Useful for visualization at small particle counts. Set to false to disable.
-    const alwaysShowAllPairs = false;
-  // Overlay canvas removed; GPU lines renderer is used for debug vectors
-  async function frame() {
+
+    async function frame() {
       const now = performance.now();
       const dtMs = now - lastT; lastT = now;
       writeMats();
-      simParams[0] = dt; simParams[1] = G; simParams[2] = 1.0; simParams[3] = particleCount; // eps = 1.0
+      simParams[0] = dt; simParams[1] = G; simParams[2] = simParams[2]; simParams[3] = particleCount; // eps unchanged
       writeSimParams();
-      writeRepulse(); // ensure R updates
-      writeRad();     // ensure radiative damping updates
-      //// Force spin = 1.0 for first 10 frames, then use UI-controlled value
-      //if (frameCount < 10) { spinParams[0] = 1.0; device.queue.writeBuffer(spinBuf, 0, spinParams); } else { writeSpin(); }
+      writeRepulse();
+      writeRad();
 
       const enc = device.createCommandEncoder();
 
-      // Collisions: optionally run detect+split every k frames
-      const doCollisions = collisionsEnabled && ((frameCount % collideEvery) === 0);
-
-      // If BH is enabled, compute morton + sort first (used for BH and possibly collisions)
-      if (useBH) {
-        // morton keys
-        {
-          const p0 = enc.beginComputePass();
-          p0.setPipeline(mortonPipe);
-          p0.setBindGroup(0, readFromA ? mortonBG_posA : mortonBG_posB);
-          p0.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-          p0.end();
-        }
-        // bitonic sort
-        let kStage = 2;
-        while (kStage <= particleCount) {
-          let jStage = kStage >> 1;
-          while (jStage > 0) {
-            writeSortJK(jStage, kStage);
-            const pS = enc.beginComputePass();
-            pS.setPipeline(bitonicPipe);
-            pS.setBindGroup(0, bitonicBG);
-            pS.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-            pS.end();
-            jStage >>= 1;
-          }
-          kStage <<= 1;
-        }
-        // cluster reduction
-        {
-          const pR = enc.beginComputePass();
-          pR.setPipeline(clusterReducePipe);
-          pR.setBindGroup(0, readFromA ? clusterReduceBG_posA : clusterReduceBG_posB);
-          pR.dispatchWorkgroups(clusterCountUsed);
-          pR.end();
-        }
-      }
-
-      if (doCollisions) {
-        device.queue.writeBuffer(pairCount, 0, new Uint32Array([0]));
-        device.queue.writeBuffer(locks, 0, new Uint32Array(particleCount));
-        device.queue.writeBuffer(claims, 0, new Uint32Array(particleCount));
-
-        // Use Morton-based neighbor detection for collisions
-        {
-          const p1 = enc.beginComputePass();
-          p1.setPipeline(detectMortonPipe);
-          p1.setBindGroup(0, readFromA ? detectMortonBG_posA : detectMortonBG_posB);
-          p1.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-          p1.end();
-          // Copy GPU-produced pairs into the visualization buffer so the
-          // lines pipeline has consistent data to render.
-          enc.copyBufferToBuffer(pairBuf, 0, visPairBuf, 0, MAX_PAIRS * 16);
-          // Immediate debug readback of pairCount after detectMorton
-          try {
-            const dbgEnc2 = device.createCommandEncoder();
-            dbgEnc2.copyBufferToBuffer(pairCount, 0, pairCountReadback, 0, 4);
-            dbgEnc2.copyBufferToBuffer(pairBuf, 0, pairBufReadback, 0, 4 * 16);
-            device.queue.submit([dbgEnc2.finish()]);
-            await pairCountReadback.mapAsync(GPUMapMode.READ);
-            await pairBufReadback.mapAsync(GPUMapMode.READ);
-            const dbgVal = new Uint32Array(pairCountReadback.getMappedRange())[0];
-            const pairsPreview = new Uint32Array(pairBufReadback.getMappedRange());
-            // Dump a small preview for dev debugging (one-shot). Remove later.
-            // one-shot preview removed to reduce console noise
-            // post-detectMorton debug readback (silent)
-            pairCountReadback.unmap(); pairBufReadback.unmap();
-          } catch (e) { console.warn('post-detectMorton readback failed', e); }
-        }
-      }
-
-      // Integrate all particles using Barnes–Hut
+      // Integrate (simple O(N^2))
       {
         const p = enc.beginComputePass();
-        writeBHParams(); // ensure uniforms updated
-        p.setPipeline(integrateBHPipe);
-        p.setBindGroup(0, readFromA ? integrateBHBG_AtoB : integrateBHBG_BtoA);
+        p.setPipeline(integratePipe);
+        p.setBindGroup(0, readFromA ? integrateBG_AtoB : integrateBG_BtoA);
         p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
         p.end();
         readFromA = !readFromA;
-        // Removed repeated CPU readbacks of particle 0 used for debugging; keeping integration flow GPU-only.
-        // Removed per-frame CPU readback of particle 0 to keep the simulation GPU-only.
       }
 
-      // Split using pairs from this frame (if any)
-      if (doCollisions) {
-        const p2 = enc.beginComputePass();
-        p2.setPipeline(splitPipe);
-        p2.setBindGroup(0, readFromA ? splitBG_velA : splitBG_velB);
-        p2.dispatchWorkgroups(Math.ceil(MAX_PAIRS / WG_SIZE));
-        p2.end();
-      }
-
-      // Render
+      // Render points + lines
       {
-        // If debug mode enabled, populate pairBuf with all (i<j) pairs on the CPU
-        if (alwaysShowAllPairs) {
-          try {
-            const maxPairsToWrite = Math.min(MAX_PAIRS, Math.floor(particleCount*(particleCount-1)/2));
-            const cpuPairs = new Uint32Array(maxPairsToWrite * 4); // vec4<u32>
-            let idx = 0;
-            for (let i=0; i<particleCount && idx < maxPairsToWrite; i++) {
-              for (let j=i+1; j<particleCount && idx < maxPairsToWrite; j++) {
-                const off = idx * 4;
-                cpuPairs[off+0] = i;
-                cpuPairs[off+1] = j;
-                cpuPairs[off+2] = 0;
-                cpuPairs[off+3] = 0;
-                idx++;
-              }
-            }
-            device.queue.writeBuffer(visPairBuf, 0, cpuPairs);
-          } catch(e) { console.warn('alwaysShowAllPairs write failed', e); }
-        }
         const viewTex = context.getCurrentTexture().createView();
         const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
         rp.setPipeline(renderPipe);
         rp.setBindGroup(0, readFromA ? renderBG_posA : renderBG_posB);
         rp.draw(4, particleCount);
-        // Draw GPU pair vectors directly into the main canvas
         rp.setPipeline(linesPipe);
         rp.setBindGroup(0, readFromA ? linesBG_posA : linesBG_posB);
-        // Each instance emits 2 vertices (line-list). Instance count = MAX_PAIRS
         rp.draw(2, MAX_PAIRS);
         rp.end();
       }
 
       device.queue.submit([enc.finish()]);
 
-      frameCount++;
-      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}`;
-  // overlay removed; GPU drawing handles debug visuals
-  requestAnimationFrame(frame);
+      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}`;
+      requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
   })();

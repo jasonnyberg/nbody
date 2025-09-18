@@ -11,7 +11,8 @@ struct Coll { rf: f32, approach: f32, _pad1: f32, _pad2: f32 }
 struct Window { w: u32, _p1: u32, _p2: u32, _p3: u32 }
 
 @group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
-@group(0) @binding(1) var<storage, read> Pvel: Vec4Buf;
+// Verlet: prevPos buffer replaces explicit velocities
+@group(0) @binding(1) var<storage, read> prevPos: Vec4Buf;
 @group(0) @binding(2) var<storage, read> M: FloatBuf;
 @group(0) @binding(3) var<uniform> S: SimParams;
 @group(0) @binding(4) var<storage, read_write> pc: PairCount; // read_write for atomicAdd
@@ -37,7 +38,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 	let mi = M.data[i];
 	if (mi <= 0.0) { return; }
 	let pi = Ppos.data[i].xyz;
-	let vi = Pvel.data[i].xyz;
+	// compute velocity from current and previous positions
+	let vi = (Ppos.data[i].xyz - prevPos.data[i].xyz) / S.dt;
 	let w = W.w;
 
 	// Scan a window in sorted order around k
@@ -57,7 +59,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
 		let rj = rf * max(1.0, pow(mj, 0.3333));
 		let R = ri + rj;
 		if (d2 < R*R) {
-			let relv = Pvel.data[j].xyz - vi;
+		let vj = (Ppos.data[j].xyz - prevPos.data[j].xyz) / S.dt;
+		let relv = vj - vi;
 			// approach flag: if C.approach >= 0.5 we only record approaching pairs,
 			// otherwise record any proximal pair (useful for visualization/debug).
 			let approachOK = (C.approach < 0.5) || (dot(dp, relv) < 0.0);
