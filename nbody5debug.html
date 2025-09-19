@@ -5,10 +5,14 @@
   <title>WebGPU N-Body (merge + split) – nbody5</title>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
-    canvas { width: 100vw; height: 100vh; display: block; }
-    /* Overlay canvas for CPU-side debug rendering */
-    #overlay { position: fixed; left: 0; top: 0; pointer-events: none; width: 100vw; height: 100vh; }
-    #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; }
+    /* Make both canvases fill the viewport and stack them explicitly */
+    canvas { width: 100vw; height: 100vh; display: block; position: fixed; left: 0; top: 0; }
+    /* Main WebGPU canvas sits above the underlay */
+    #c { z-index: 1; }
+    /* Overlay is now an underlay (drawn beneath the WebGPU canvas) */
+    #overlay { position: fixed; left: 0; top: 0; pointer-events: none; width: 100vw; height: 100vh; z-index: 0; }
+    /* UI must remain above everything */
+    #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; z-index: 2; }
     #ui label { display:block; margin: 6px 0 2px; }
   </style>
 </head>
@@ -65,6 +69,10 @@
   <!-- Debug overlays rendered by GPU shader; toggles removed (always enabled via code) -->
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
+    <div style="margin-top:6px;">
+      <button id="startStop">Pause</button>
+      <button id="step">Step</button>
+    </div>
     <div style="margin-top:6px;">
       <button id="dumpPairs">Dump pairs (one frame)</button>
     </div>
@@ -418,6 +426,96 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
      }
      writeMats();
 
+    // Render shader used by full build — include here so debug can create the render pipeline
+    const renderWGSL = `
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct FloatBuf { data: array<f32>, }
+struct Mats { m: array<vec4<f32>, 10>, }
+@group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
+@group(0) @binding(1) var<storage, read> M: FloatBuf;
+@group(0) @binding(2) var<uniform> U: Mats;
+
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+  @location(1) radiate: f32,
+  @location(2) massNorm: f32,
+};
+
+fn loadMat(idx: u32) -> mat4x4<f32> {
+  let b = idx * 4u;
+  return mat4x4<f32>(U.m[b+0u], U.m[b+1u], U.m[b+2u], U.m[b+3u]);
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
+  // Per-instance particle index
+  let pos4 = Ppos.data[iid];
+  let world = pos4.xyz;
+  let mass = M.data[iid];
+
+  // Cull dead particles (mass <= 0)
+  if (mass <= 0.0) {
+    var out: VSOut;
+    out.pos = vec4<f32>(2.0, 2.0, 1.0, 1.0);
+    out.uv = vec2<f32>(2.0);
+    out.radiate = 0.0;
+    out.massNorm = 0.0;
+    return out;
+  }
+
+  // Corner in NDC pixel space: (-1,-1), (-1,1), (1,-1), (1,1)
+  var corner: vec2<f32>;
+  switch (vid & 3u) {
+    case 0u: { corner = vec2<f32>(-1.0, -1.0); }
+    case 1u: { corner = vec2<f32>(-1.0,  1.0); }
+    case 2u: { corner = vec2<f32>( 1.0, -1.0); }
+    default: { corner = vec2<f32>( 1.0,  1.0); }
+  }
+
+  let proj = loadMat(0u);
+  let view = loadMat(1u);
+  let viewPos = view * vec4<f32>(world, 1.0);
+  let clip = proj * viewPos;
+
+  // Viewport and size parameters packed at U.m[8]: (width, height, sizeScale, invLogMax)
+  let vp = U.m[8u];
+  let width = vp.x; let height = vp.y; let sizeScale = vp.z; let invLogMax = vp.w;
+  // Depth-scaled size similar to nbody3
+  let baseSize = max(1.0, pow(max(mass, 0.0), 0.3333));
+  let sizePx = max(2.0, sizeScale * baseSize / max(1.0, -viewPos.z));
+
+  // Convert pixel offset to clip-space offset (pre-divide), account for clip.w
+  let offsetClip = vec2<f32>(
+    2.0 * corner.x * sizePx / max(1.0, width),
+   -2.0 * corner.y * sizePx / max(1.0, height)
+  ) * clip.w;
+
+  // Mass normalization for color like nbody3
+  let mNorm = clamp(log(1.0 + max(mass, 0.0)) * invLogMax, 0.0, 1.0);
+
+  var out: VSOut;
+  out.pos = vec4<f32>(clip.xy + offsetClip, clip.z, clip.w);
+  out.uv = corner; // pass to fragment for circular mask
+  out.radiate = pos4.w;
+  out.massNorm = mNorm;
+  return out;
+}
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4<f32> {
+  let r = length(in.uv);
+  if (r > 1.0) { discard; }
+  // Soft edge alpha
+  let alpha = clamp((1.0 - r) / 0.3, 0.0, 1.0);
+  // Radiative coloring like nbody3: red from radiate, green/blue from mass
+  let redRadiate = clamp(5.0 * in.radiate, 0.0, 1.0);
+  let g = in.massNorm;
+  let b = 1.0 - in.massNorm;
+  return vec4<f32>(redRadiate, g, b, alpha);
+}
+`;
+
     // Uniforms
     // SimParams is 4 floats (16 bytes): dt, G, eps, num
     const simParams = new Float32Array([dt, G, 1.0, particleCount]); // eps defaults to 1.0
@@ -437,9 +535,24 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
     function writeRad(){ radParams[0]=radiativeDamping; device.queue.writeBuffer(radBuf, 0, radParams); }
     writeRad();
 
+    // Add spin and damping uniforms + writers so UI callbacks have functions to call
+    const spinParams = new Float32Array([spin, 0, 0, 0]);
+    const spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeSpin() { spinParams[0] = spin; device.queue.writeBuffer(spinBuf, 0, spinParams); }
+    writeSpin();
+
+    const dampParams = new Float32Array([damping, 0, 0, 0]);
+    const dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeDamp() { dampParams[0] = damping; device.queue.writeBuffer(dampBuf, 0, dampParams); }
+    writeDamp();
+
     // create bind-group placeholders; actual bind-groups use matsBuf which is guaranteed to exist later
     let boxesBG_A;
     let boxesBG_B;
+
+    // Expose pipeline variables in outer scope so frame() can use them
+    let renderPipe, renderBG_posA, renderBG_posB;
+    let linesPipe, linesBG_posA, linesBG_posB;
 
     // Precompute all unique pairs (i<j) once
     const allPairs = new Uint32Array(MAX_PAIRS * 4);
@@ -463,6 +576,21 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
     let posIsA = true;
     let lastT = performance.now();
 
+    // Simulation control state
+    let paused = false;
+    let stepRequested = false;
+    const startStopBtn = document.getElementById('startStop');
+    const stepBtn = document.getElementById('step');
+    startStopBtn.addEventListener('click', () => {
+      paused = !paused;
+      startStopBtn.textContent = paused ? 'Start' : 'Pause';
+    });
+    stepBtn.addEventListener('click', () => {
+      // Ensure we're paused before stepping; request a single step
+      if (!paused) { paused = true; startStopBtn.textContent = 'Start'; }
+      stepRequested = true;
+    });
+
     async function frame() {
       const now = performance.now();
       const dtMs = now - lastT; lastT = now;
@@ -472,6 +600,30 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
       writeRepulse();
       writeRad();
 
+      // CPU fallback animation: small rotation so debug view is visibly animated
+      // This runs when the GPU integrate step is not present in the debug build.
+      if (!paused || stepRequested) {
+      (function cpuAnimate(){
+         // scale rotation by frame time (normalize to ~60Hz)
+         const speed = 0.02; // base radians per 16.67ms
+         const factor = Math.max(0.01, Math.min(4.0, (dtMs || 16.67) / 16.67));
+         const a = speed * factor;
+         const ca = Math.cos(a), sa = Math.sin(a);
+         for (let i=0;i<particleCount;i++){
+           const o = i*stride;
+           const x = posInit[o], y = posInit[o+1];
+           // rotate around Y by small angle: (x,z) -> (x*cos - z*sin, x*sin + z*cos)
+           const z = posInit[o+2];
+           const nx = x * ca - z * sa;
+           const nz = x * sa + z * ca;
+           posInit[o] = nx;
+           posInit[o+2] = nz;
+         }
+         // write back to GPU buffer that reduction/render read from
+         device.queue.writeBuffer(posA, 0, posInit);
+      })();
+      }
+
       const enc = device.createCommandEncoder();
 
       // Integrate (simple O(N^2))
@@ -480,7 +632,7 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
         // and writes into the other buffer. After running, flip posIsA to indicate the
         // buffer that now contains the up-to-date positions. If integrate is skipped,
         // posIsA remains accurate (pre-initialized to true because posA contains initial data).
-        if (typeof integratePipe !== 'undefined' && typeof integrateBG_AtoB !== 'undefined') {
+        if ((!paused || stepRequested) && typeof integratePipe !== 'undefined' && typeof integrateBG_AtoB !== 'undefined') {
           const p = enc.beginComputePass();
           p.setPipeline(integratePipe);
           p.setBindGroup(0, posIsA ? integrateBG_AtoB : integrateBG_BtoA);
@@ -515,7 +667,7 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
         }
 
         const viewTex = context.getCurrentTexture().createView();
-        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:1.0,g:0.0,b:1.0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
+        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0.0,g:0.0,b:0.0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
 
         // Optional: draw sprites if render pipeline exists
         if (typeof renderPipe !== 'undefined' && typeof renderBG_posA !== 'undefined') {
@@ -541,6 +693,9 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
 
       device.queue.submit([enc.finish()]);
 
+      // If we performed a single step, clear the request so subsequent frames remain paused
+      if (stepRequested) stepRequested = false;
++
       // Draw CPU-side debug overlay of initial particle positions to confirm projection/camera
       (function drawCpuOverlay(){
         octx.clearRect(0,0,overlay.width,overlay.height);
@@ -556,19 +711,20 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
         }
         for (let i=0;i<particleCount;i++){
           const o = i*stride;
+          // posInit now holds the authoritative CPU-side positions when integrate is missing
           const P = [ posInit[o], posInit[o+1], posInit[o+2], 1.0 ];
-          const v1 = mulMat4Vec4(view, P);
-          const v2 = mulMat4Vec4(proj, v1);
-          if (v2[3] === 0) continue;
-          const ndcX = v2[0]/v2[3];
-          const ndcY = v2[1]/v2[3];
-          const sx = (ndcX * 0.5 + 0.5) * overlay.width;
-          const sy = (1.0 - (ndcY * 0.5 + 0.5)) * overlay.height;
-          octx.beginPath(); octx.arc(sx, sy, 3, 0, Math.PI*2); octx.fill();
-        }
+           const v1 = mulMat4Vec4(view, P);
+           const v2 = mulMat4Vec4(proj, v1);
+           if (v2[3] === 0) continue;
+           const ndcX = v2[0]/v2[3];
+           const ndcY = v2[1]/v2[3];
+           const sx = (ndcX * 0.5 + 0.5) * overlay.width;
+           const sy = (1.0 - (ndcY * 0.5 + 0.5)) * overlay.height;
+           octx.beginPath(); octx.arc(sx, sy, 3, 0, Math.PI*2); octx.fill();
+         }
       })();
 
-      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}  buckets: ${bucketCount}  posIsA: ${posIsA}`;
+      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}  buckets: ${bucketCount}  posIsA: ${posIsA}${paused ? '  [PAUSED]' : ''}`;
       requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
