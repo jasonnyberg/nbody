@@ -5,14 +5,10 @@
   <title>WebGPU N-Body (merge + split) – nbody5</title>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
-    /* Make both canvases fill the viewport and stack them explicitly */
-    canvas { width: 100vw; height: 100vh; display: block; position: fixed; left: 0; top: 0; }
-    /* Main WebGPU canvas sits above the underlay */
-    #c { z-index: 1; }
-    /* Overlay is now an underlay (drawn beneath the WebGPU canvas) */
-    #overlay { position: fixed; left: 0; top: 0; pointer-events: none; width: 100vw; height: 100vh; z-index: 0; }
-    /* UI must remain above everything */
-    #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; z-index: 2; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    /* Overlay canvas for CPU-side debug rendering */
+    #overlay { position: fixed; left: 0; top: 0; pointer-events: none; width: 100vw; height: 100vh; }
+    #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; }
     #ui label { display:block; margin: 6px 0 2px; }
   </style>
 </head>
