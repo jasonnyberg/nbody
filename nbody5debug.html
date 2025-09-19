@@ -128,6 +128,10 @@
     let theta = 0.60;             // new: BH opening angle
     let clusterSize = 64;         // new: leaf capacity approximation
 
+    // Debug build: Morton/BH paths are disabled; keep UI responsive with no-op writers
+    function writeWindow() { /* no-op in debug build */ }
+    function writeBHParams() { /* no-op in debug build */ }
+
     const gEl = document.getElementById('g');
     const gVal = document.getElementById('gVal');
     gEl.addEventListener('input', () => { G = parseFloat(gEl.value); gVal.textContent = G.toFixed(2); writeSimParams(); });
@@ -269,251 +273,137 @@
     const pairBufReadback = device.createBuffer({ size: DUMP_PAIRS_N * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
-    // Uniforms
-    const simParams = new Float32Array([dt, G, 4.0, particleCount]); // eps defaults to 4.0
-    const simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeSimParams(){ device.queue.writeBuffer(simParamsBuf, 0, simParams.buffer, simParams.byteOffset, simParams.byteLength); }
-    writeSimParams();
+    // --- Octree-bucket AABB debug (post-sort reduction approximation) ---
+    // Partition sorted positions into small buckets in Morton order (for debug we use contiguous buckets)
+    const BUCKET_SIZE = 4; // tune for debug; smaller -> more boxes
+    const bucketCount = Math.ceil(particleCount / BUCKET_SIZE);
+    // nodeBuf holds min(vec4) then max(vec4) per bucket (2 vec4 per bucket)
+    const nodeBuf = device.createBuffer({ size: bucketCount * 2 * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    const nodeParams = new Float32Array([particleCount, BUCKET_SIZE, bucketCount, 0]);
+    const nodeParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(nodeParamsBuf, 0, nodeParams);
 
-    const restParams = new Float32Array([restitution, 0,0,0]);
-    const restBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeRest(){ restParams[0]=restitution; device.queue.writeBuffer(restBuf, 0, restParams); }
-    writeRest();
-
-    const radiusParams = new Float32Array([radiusFactor, 1.0, 0, 0]);
-    const radiusBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeRadius(){ radiusParams[0]=radiusFactor; device.queue.writeBuffer(radiusBuf, 0, radiusParams); }
-    writeRadius();
-
-    const approachEl = document.getElementById('approach');
-    approachEl.addEventListener('input', () => {
-      const v = approachEl.checked ? 1.0 : 0.0;
-      radiusParams[1] = v; device.queue.writeBuffer(radiusBuf, 0, radiusParams);
-    });
-    radiusParams[1] = approachEl.checked ? 1.0 : 0.0;
-    device.queue.writeBuffer(radiusBuf, 0, radiusParams);
-    window.setApproachOnly = (on) => { approachEl.checked = !!on; approachEl.dispatchEvent(new Event('input')); };
-
-    const dumpBtn = document.getElementById('dumpPairs');
-    dumpBtn.addEventListener('click', async () => {
-      try {
-        const dbgEnc = device.createCommandEncoder();
-        dbgEnc.copyBufferToBuffer(outPairCount, 0, pairCountReadback, 0, 4);
-        dbgEnc.copyBufferToBuffer(visPairBuf, 0, pairBufReadback, 0, DUMP_PAIRS_N * 16);
-        device.queue.submit([dbgEnc.finish()]);
-        await pairCountReadback.mapAsync(GPUMapMode.READ);
-        await pairBufReadback.mapAsync(GPUMapMode.READ);
-        const cnt = new Uint32Array(pairCountReadback.getMappedRange())[0];
-        const pairs = new Uint32Array(pairBufReadback.getMappedRange());
-        const out = [];
-        const m = Math.min(DUMP_PAIRS_N, cnt);
-        for (let i=0;i<m;i++) out.push([pairs[i*4+0], pairs[i*4+1], pairs[i*4+2], pairs[i*4+3]]);
-        console.log('Dump pairs:', cnt, out);
-        pairCountReadback.unmap(); pairBufReadback.unmap();
-      } catch (e) { console.warn('dump pairs failed', e); }
-    });
-
-    const dampParams = new Float32Array([damping, 0,0,0]);
-    const dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeDamp(){ dampParams[0]=damping; device.queue.writeBuffer(dampBuf, 0, dampParams); }
-    writeDamp();
-
-    const spinParams = new Float32Array([spin, 0,0,0]);
-    const spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeSpin(){ spinParams[0]=spin; device.queue.writeBuffer(spinBuf, 0, spinParams); }
-    writeSpin();
-
-    const repulseParams = new Float32Array([R, 0,0,0]);
-    const repulseBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeRepulse(){ repulseParams[0]=R; device.queue.writeBuffer(repulseBuf, 0, repulseParams); }
-    writeRepulse();
-
-    const radParams = new Float32Array([radiativeDamping, 0,0,0]);
-    const radBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeRad(){ radParams[0]=radiativeDamping; device.queue.writeBuffer(radBuf, 0, radParams); }
-    writeRad();
-
-    // Matrices + viewport params in a 10-vec4 uniform for alignment
-    let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
-    const mats = new Float32Array(36); // proj(16) + view(16) + vp(vec4)
-    const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeMats() {
-      proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
-      updateView();
-      mats.set(proj, 0);
-      mats.set(view, 16);
-      mats[32] = canvas.width;  // viewport W
-      mats[33] = canvas.height; // viewport H
-      mats[34] = 18.0;          // sprite sizeScale in pixels
-      mats[35] = 0.0;           // padding/unused
-      device.queue.writeBuffer(matsBuf, 0, mats);
-    }
-    writeMats();
-
-    // WGSL Shaders (inline)
-    const renderWGSL = /* wgsl */`
-struct VSOut {
-  @builtin(position) pos: vec4f,
-  @location(0) color: vec4f,
-};
+    // WGSL: reduction that computes min/max per bucket
+    const reduceWGSL = `
+struct UBO { n: f32, bucket: f32, bucketCount: f32, pad: f32 };
 @group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
-@group(0) @binding(1) var<storage, read> massBuf: array<f32>;
-struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
-@group(0) @binding(2) var<uniform> ubo: UBO;
+@group(0) @binding(1) var<storage, read_write> nodeBuf: array<vec4f>;
+@group(0) @binding(2) var<uniform> params: UBO;
 
-fn getCorner(i: u32) -> vec2f {
-  return select(vec2f(-1.0, -1.0), select(vec2f(1.0, -1.0), select(vec2f(-1.0, 1.0), vec2f(1.0,1.0), i==3u), i==2u), i==1u);
-}
-
-@vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
-  let P = posBuf[iid];
-  let mass = massBuf[iid];
-  let vp4 = ubo.proj * ubo.view * vec4f(P.xyz, 1.0);
-  let w = ubo.vp.x;
-  let h = ubo.vp.y;
-  let baseSize = ubo.vp.z;
-  let sizePx = baseSize * pow(max(mass, 1.0), 0.3333);
-  let offs = getCorner(vid);
-  let offsClip = vec2f(2.0 * sizePx / w, 2.0 * sizePx / h) * offs;
-  var o: VSOut;
-  o.pos = vec4f(vp4.xy + offsClip * vp4.w, vp4.z, vp4.w);
-  o.color = vec4f(0.2, 1.0, 1.0, 0.9);
-  return o;
-}
-
-@fragment fn fs(inp: VSOut) -> @location(0) vec4f {
-  return inp.color;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let k = gid.x;
+  let N = u32(params.n);
+  let bsz = u32(params.bucket);
+  let start = k * bsz;
+  if (start >= N) {
+    // empty slot
+    nodeBuf[2u*k] = vec4f(0.0);
+    nodeBuf[2u*k+1u] = vec4f(0.0);
+    return;
+  }
+  var mn = vec3f(1e30, 1e30, 1e30);
+  var mx = vec3f(-1e30, -1e30, -1e30);
+  let end = min(start + bsz, N);
+  var i = start;
+  loop {
+    let p = posBuf[i].xyz;
+    mn = min(mn, p);
+    mx = max(mx, p);
+    i = i + 1u;
+    if (i >= end) { break; }
+  }
+  nodeBuf[2u*k] = vec4f(mn, 0.0);
+  nodeBuf[2u*k+1u] = vec4f(mx, 0.0);
 }
 `;
+    const reduceModule = device.createShaderModule({ code: reduceWGSL });
+    const reducePipe = device.createComputePipeline({ layout: 'auto', compute: { module: reduceModule, entryPoint: 'main' } });
 
-    const linesWGSL = /* wgsl */`
+    // Bind groups for reduction (posA/posB)
+    const reduceBG_A = device.createBindGroup({ layout: reducePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: nodeBuf } },
+      { binding: 2, resource: { buffer: nodeParamsBuf } },
+    ]});
+    const reduceBG_B = device.createBindGroup({ layout: reducePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: nodeBuf } },
+      { binding: 2, resource: { buffer: nodeParamsBuf } },
+    ]});
+
+    // WGSL for rendering boxes as instanced line geometry (24 edges -> 48 vertices per instance)
+    const boxesWGSL = `
 struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
-@group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
-@group(0) @binding(1) var<storage, read> pairs: array<vec4u>;
+@group(0) @binding(0) var<storage, read> nodeBuf: array<vec4f>;
 struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
-@group(0) @binding(2) var<uniform> ubo: UBO;
-@group(0) @binding(3) var<storage, read> pairCountBuf: array<u32>; // [0] = count
+@group(0) @binding(1) var<uniform> ubo: UBO;
 
-fn projView(p: vec3f) -> vec4f {
-  return ubo.proj * ubo.view * vec4f(p, 1.0);
+const EDGES : array<u32, 24> = array<u32,24>(
+  0u,1u, 1u,3u, 3u,2u, 2u,0u,  // bottom
+  4u,5u, 5u,7u, 7u,6u, 6u,4u,  // top
+  0u,4u, 1u,5u, 2u,6u, 3u,7u   // verticals
+);
+
+fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
+  let bx = f32((c & 1u));
+  let by = f32(((c >> 1u) & 1u));
+  let bz = f32(((c >> 2u) & 1u));
+  return mn + vec3f(bx, by, bz) * (mx - mn);
 }
 
 @vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
-  let count = pairCountBuf[0];
   var o: VSOut;
-  if (iid >= count) {
-    o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+  let edge = vid / 2u;
+  if (u32(iid) >= ${bucketCount}u) {
+    o.pos = vec4f(2.0,2.0,2.0,1.0);
     o.col = vec4f(0.0);
     return o;
   }
-  let pr = pairs[iid];
-  let i = pr.x; let j = pr.y;
-  let a = posBuf[i].xyz;
-  let b = posBuf[j].xyz;
-  let col = vec3f(1.0, 0.6, 0.1);
-  let P = select(a, b, vid == 1u);
-  o.pos = projView(P);
-  o.col = vec4f(col, 0.9);
+  let a = nodeBuf[2u*iid].xyz;
+  let b = nodeBuf[2u*iid+1u].xyz;
+  let ea = EDGES[edge*2u + 0u];
+  let eb = EDGES[edge*2u + 1u];
+  let endpoint = vid % 2u;
+  let ci = select(ea, eb, endpoint == 1u);
+  let P = cornerPos(ci, a, b);
+  let vp4 = ubo.proj * ubo.view * vec4f(P, 1.0);
+  o.pos = vp4;
+  // color by depth approximation: use teal
+  o.col = vec4f(0.0, 0.8, 1.0, 0.8);
   return o;
 }
 
 @fragment fn fs(inp: VSOut) -> @location(0) vec4f { return inp.col; }
 `;
-
-    const integrateWGSL = /* wgsl */`
-struct Sim { dt: f32, G: f32, eps: f32, n: f32 };
-@group(0) @binding(0) var<storage, read> posIn: array<vec4f>;
-@group(0) @binding(1) var<storage, read> prevIn: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> posOut: array<vec4f>;
-@group(0) @binding(3) var<storage, read_write> prevOut: array<vec4f>;
-@group(0) @binding(4) var<uniform> sim: Sim;
-@group(0) @binding(5) var<storage, read> masses: array<f32>;
-@group(0) @binding(6) var<uniform> dampU: vec4f;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let i = gid.x;
-  let N = u32(sim.n);
-  if (i >= N) { return; }
-  let Pi = posIn[i].xyz;
-  var a = vec3f(0.0);
-  for (var j: u32 = 0u; j < N; j++) {
-    if (j == i) { continue; }
-    let r = posIn[j].xyz - Pi;
-    let d2 = max(dot(r, r), sim.eps * sim.eps);
-    let inv = inverseSqrt(d2 * d2 * d2);
-    a += (sim.G * masses[j]) * r * inv;
-  }
-  let dt2 = sim.dt * sim.dt;
-  let next = Pi + (Pi - prevIn[i].xyz) * dampU.x + a * dt2;
-  prevOut[i] = vec4f(Pi, 0.0);
-  posOut[i] = vec4f(next, 0.0);
-}
-`;
-
-    // Pipelines
-    const renderModule = device.createShaderModule({ code: renderWGSL });
-    const renderPipe = device.createRenderPipeline({
+    const boxesModule = device.createShaderModule({ code: boxesWGSL });
+    const boxesPipe = device.createRenderPipeline({
       layout: 'auto',
-      vertex: { module: renderModule, entryPoint: 'vs' },
-      fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
-      primitive: { topology: 'triangle-strip', cullMode: 'none' }
-    });
-
-    const linesModule = device.createShaderModule({ code: linesWGSL });
-    const linesPipe = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: linesModule, entryPoint: 'vs' },
-      fragment: { module: linesModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
+      vertex: { module: boxesModule, entryPoint: 'vs' },
+      fragment: { module: boxesModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
       primitive: { topology: 'line-list', cullMode: 'none' }
     });
 
-    const integrateModule = device.createShaderModule({ code: integrateWGSL });
-    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
+    // Matrices + viewport params in a 10-vec4 uniform for alignment (used by renderers and box shader)
+    let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
+     const mats = new Float32Array(40); // 10 * vec4
+     const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+     function writeMats() {
+       proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
+       updateView();
+       mats.set(proj, 0);
+       mats.set(view, 16);
+       mats[32] = canvas.width;  // viewport W
+       mats[33] = canvas.height; // viewport H
+       mats[34] = 18.0;          // sprite sizeScale in pixels
+       mats[35] = 1.0 / Math.log(1.0 + 8.0); // inverse log(maxMass+1)
+       device.queue.writeBuffer(matsBuf, 0, mats);
+     }
+     writeMats();
 
-    // Bind groups
-    const renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: masses } },
-      { binding: 2, resource: { buffer: matsBuf } },
-    ]});
-    const renderBG_posB = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: masses } },
-      { binding: 2, resource: { buffer: matsBuf } },
-    ]});
-
-    const linesBG_posA = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: visPairBuf } },
-      { binding: 2, resource: { buffer: matsBuf } },
-      { binding: 3, resource: { buffer: outPairCount } },
-    ]});
-    const linesBG_posB = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: visPairBuf } },
-      { binding: 2, resource: { buffer: matsBuf } },
-      { binding: 3, resource: { buffer: outPairCount } },
-    ]});
-
-    const integrateBG_AtoB = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: prevPosA } },
-      { binding: 2, resource: { buffer: posB } },
-      { binding: 3, resource: { buffer: prevPosB } },
-      { binding: 4, resource: { buffer: simParamsBuf } },
-      { binding: 5, resource: { buffer: masses } },
-      { binding: 6, resource: { buffer: dampBuf } },
-    ]});
-    const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: prevPosB } },
-      { binding: 2, resource: { buffer: posA } },
-      { binding: 3, resource: { buffer: prevPosA } },
-      { binding: 4, resource: { buffer: simParamsBuf } },
-      { binding: 5, resource: { buffer: masses } },
-      { binding: 6, resource: { buffer: dampBuf } },
-    ]});
+    // create bind-group placeholders; actual bind-groups use matsBuf which is guaranteed to exist later
+    let boxesBG_A;
+    let boxesBG_B;
 
     // Precompute all unique pairs (i<j) once
     const allPairs = new Uint32Array(MAX_PAIRS * 4);
@@ -556,8 +446,29 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         readFromA = !readFromA;
       }
 
+      // Compute bucket AABBs from the just-written position buffer
+      {
+        const rp = enc.beginComputePass();
+        rp.setPipeline(reducePipe);
+        rp.setBindGroup(0, readFromA ? reduceBG_B : reduceBG_A); // note: readFromA already toggled, so use the buffer that now holds current positions
+        rp.dispatchWorkgroups(bucketCount);
+        rp.end();
+      }
+
       // Render points + lines
       {
+        // Ensure boxes bind-groups exist (matsBuf is ready after writeMats())
+        if (!boxesBG_A) {
+          boxesBG_A = device.createBindGroup({ layout: boxesPipe.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: nodeBuf } },
+            { binding: 1, resource: { buffer: matsBuf } },
+          ]});
+          boxesBG_B = device.createBindGroup({ layout: boxesPipe.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: nodeBuf } },
+            { binding: 1, resource: { buffer: matsBuf } },
+          ]});
+        }
+        
         const viewTex = context.getCurrentTexture().createView();
         const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
         rp.setPipeline(renderPipe);
@@ -566,6 +477,12 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         rp.setPipeline(linesPipe);
         rp.setBindGroup(0, readFromA ? linesBG_posA : linesBG_posB);
         rp.draw(2, MAX_PAIRS);
+
+        // Draw bucket boxes (12 edges -> 24 vertices per instance)
+        rp.setPipeline(boxesPipe);
+        rp.setBindGroup(0, readFromA ? boxesBG_A : boxesBG_B);
+        rp.draw(24, bucketCount);
+
         rp.end();
       }
 
