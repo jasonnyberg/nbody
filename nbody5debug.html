@@ -6,12 +6,15 @@
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
     canvas { width: 100vw; height: 100vh; display: block; }
+    /* Overlay canvas for CPU-side debug rendering */
+    #overlay { position: fixed; left: 0; top: 0; pointer-events: none; width: 100vw; height: 100vh; }
     #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; }
     #ui label { display:block; margin: 6px 0 2px; }
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
+  <canvas id="overlay"></canvas>
   <div id="ui">
     <div><b>Controls</b></div>
     <label>G: <span id="gVal">0.30</span></label>
@@ -71,6 +74,8 @@
   "use strict";
   (async () => {
     const canvas = document.getElementById('c');
+    const overlay = document.getElementById('overlay');
+    const octx = overlay.getContext('2d');
     const statsDiv = document.getElementById('stats');
     if (!('gpu' in navigator)) { alert('WebGPU not supported'); return; }
 
@@ -92,6 +97,11 @@
           device = await adapter.requestDevice();
         }
       }
+      // Debug: log uncaptured GPU errors to console to help diagnose why nothing renders
+      if (device) {
+        try { device.addEventListener('uncapturederror', (ev) => console.error('GPU uncap error', ev)); } catch (e) {}
+        try { device.onuncapturederror = (ev) => console.error('GPU onuncapturederror', ev); } catch (e) {}
+      }
     } catch (e) {
       console.warn('requestDevice failed, cannot continue:', e);
       alert('Unable to initialize GPU device');
@@ -106,6 +116,8 @@
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
       canvas.height = Math.floor(canvas.clientHeight * dpr);
+      overlay.width = canvas.width;
+      overlay.height = canvas.height;
       context.configure({ device, format, alphaMode: 'opaque' });
     }
     resize();
@@ -332,6 +344,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       { binding: 2, resource: { buffer: nodeParamsBuf } },
     ]});
 
+    console.log('DEBUG: reducePipe/bindgroups created', { reducePipe: !!reducePipe, reduceBG_A: !!reduceBG_A, reduceBG_B: !!reduceBG_B });
+
     // WGSL for rendering boxes as instanced line geometry (24 edges -> 48 vertices per instance)
     const boxesWGSL = `
 struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
@@ -384,6 +398,9 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
       primitive: { topology: 'line-list', cullMode: 'none' }
     });
 
+    // NOTE: matsBuf is declared later; avoid referencing it here to prevent TDZ ReferenceError.
+    console.log('DEBUG: boxesPipe created', { boxesPipe: !!boxesPipe, nodeBufSize: bucketCount * 2 * 16 });
+
     // Matrices + viewport params in a 10-vec4 uniform for alignment (used by renderers and box shader)
     let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
      const mats = new Float32Array(40); // 10 * vec4
@@ -400,6 +417,25 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
        device.queue.writeBuffer(matsBuf, 0, mats);
      }
      writeMats();
+
+    // Uniforms
+    // SimParams is 4 floats (16 bytes): dt, G, eps, num
+    const simParams = new Float32Array([dt, G, 1.0, particleCount]); // eps defaults to 1.0
+    const simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeSimParams(){ device.queue.writeBuffer(simParamsBuf, 0, simParams.buffer, simParams.byteOffset, simParams.byteLength); }
+    writeSimParams();
+
+    // New: repulsion (R) uniform
+    const repulseParams = new Float32Array([R, 0,0,0]);
+    const repulseBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRepulse(){ repulseParams[0]=R; device.queue.writeBuffer(repulseBuf, 0, repulseParams); }
+    writeRepulse();
+
+    // New: radiative damping uniform
+    const radParams = new Float32Array([radiativeDamping, 0,0,0]);
+    const radBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRad(){ radParams[0]=radiativeDamping; device.queue.writeBuffer(radBuf, 0, radParams); }
+    writeRad();
 
     // create bind-group placeholders; actual bind-groups use matsBuf which is guaranteed to exist later
     let boxesBG_A;
@@ -422,7 +458,9 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
     device.queue.writeBuffer(outPairCount, 0, new Uint32Array([pIdx]));
 
     // Frame loop
-    let readFromA = true;
+    // Track which buffer currently contains the up-to-date particle positions.
+    // posIsA === true -> posA holds current positions; false -> posB holds current positions.
+    let posIsA = true;
     let lastT = performance.now();
 
     async function frame() {
@@ -438,19 +476,26 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
 
       // Integrate (simple O(N^2))
       {
-        const p = enc.beginComputePass();
-        p.setPipeline(integratePipe);
-        p.setBindGroup(0, readFromA ? integrateBG_AtoB : integrateBG_BtoA);
-        p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-        p.end();
-        readFromA = !readFromA;
+        // If an integrate pipeline exists, it reads from the buffer indicated by posIsA
+        // and writes into the other buffer. After running, flip posIsA to indicate the
+        // buffer that now contains the up-to-date positions. If integrate is skipped,
+        // posIsA remains accurate (pre-initialized to true because posA contains initial data).
+        if (typeof integratePipe !== 'undefined' && typeof integrateBG_AtoB !== 'undefined') {
+          const p = enc.beginComputePass();
+          p.setPipeline(integratePipe);
+          p.setBindGroup(0, posIsA ? integrateBG_AtoB : integrateBG_BtoA);
+          p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
+          p.end();
+          posIsA = !posIsA;
+        }
       }
 
       // Compute bucket AABBs from the just-written position buffer
       {
         const rp = enc.beginComputePass();
         rp.setPipeline(reducePipe);
-        rp.setBindGroup(0, readFromA ? reduceBG_B : reduceBG_A); // note: readFromA already toggled, so use the buffer that now holds current positions
+        // Use the buffer that currently holds the up-to-date positions (posIsA)
+        rp.setBindGroup(0, posIsA ? reduceBG_A : reduceBG_B);
         rp.dispatchWorkgroups(bucketCount);
         rp.end();
       }
@@ -468,19 +513,27 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
             { binding: 1, resource: { buffer: matsBuf } },
           ]});
         }
-        
-        const viewTex = context.getCurrentTexture().createView();
-        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
-        rp.setPipeline(renderPipe);
-        rp.setBindGroup(0, readFromA ? renderBG_posA : renderBG_posB);
-        rp.draw(4, particleCount);
-        rp.setPipeline(linesPipe);
-        rp.setBindGroup(0, readFromA ? linesBG_posA : linesBG_posB);
-        rp.draw(2, MAX_PAIRS);
 
-        // Draw bucket boxes (12 edges -> 24 vertices per instance)
+        const viewTex = context.getCurrentTexture().createView();
+        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:1.0,g:0.0,b:1.0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
+
+        // Optional: draw sprites if render pipeline exists
+        if (typeof renderPipe !== 'undefined' && typeof renderBG_posA !== 'undefined') {
+          rp.setPipeline(renderPipe);
+          rp.setBindGroup(0, posIsA ? renderBG_posA : renderBG_posB);
+          rp.draw(4, particleCount);
+        }
+
+        // Optional: draw debug pairs if lines pipeline exists
+        if (typeof linesPipe !== 'undefined' && typeof linesBG_posA !== 'undefined') {
+          rp.setPipeline(linesPipe);
+          rp.setBindGroup(0, posIsA ? linesBG_posA : linesBG_posB);
+          rp.draw(2, MAX_PAIRS);
+        }
+
+        // Draw bucket boxes (12 edges -> 24 vertices per instance) -- boxesPipe is present
         rp.setPipeline(boxesPipe);
-        rp.setBindGroup(0, readFromA ? boxesBG_A : boxesBG_B);
+        rp.setBindGroup(0, posIsA ? boxesBG_A : boxesBG_B);
         rp.draw(24, bucketCount);
 
         rp.end();
@@ -488,7 +541,34 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
 
       device.queue.submit([enc.finish()]);
 
-      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}`;
+      // Draw CPU-side debug overlay of initial particle positions to confirm projection/camera
+      (function drawCpuOverlay(){
+        octx.clearRect(0,0,overlay.width,overlay.height);
+        octx.fillStyle = 'rgba(255,200,0,0.9)';
+        // helper: multiply column-major 4x4 matrix by vec4
+        function mulMat4Vec4(m, v){
+          return [
+            m[0]*v[0] + m[4]*v[1] + m[8]*v[2] + m[12]*v[3],
+            m[1]*v[0] + m[5]*v[1] + m[9]*v[2] + m[13]*v[3],
+            m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3],
+            m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3]
+          ];
+        }
+        for (let i=0;i<particleCount;i++){
+          const o = i*stride;
+          const P = [ posInit[o], posInit[o+1], posInit[o+2], 1.0 ];
+          const v1 = mulMat4Vec4(view, P);
+          const v2 = mulMat4Vec4(proj, v1);
+          if (v2[3] === 0) continue;
+          const ndcX = v2[0]/v2[3];
+          const ndcY = v2[1]/v2[3];
+          const sx = (ndcX * 0.5 + 0.5) * overlay.width;
+          const sy = (1.0 - (ndcY * 0.5 + 0.5)) * overlay.height;
+          octx.beginPath(); octx.arc(sx, sy, 3, 0, Math.PI*2); octx.fill();
+        }
+      })();
+
+      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}  buckets: ${bucketCount}  posIsA: ${posIsA}`;
       requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
