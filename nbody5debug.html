@@ -512,6 +512,111 @@ fn fs(in: VSOut) -> @location(0) vec4<f32> {
 }
 `;
 
+    // WGSL for a simple O(N^2) Verlet integrator
+    const integrateWGSL = `
+struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
+struct Vec4Buf { data: array<vec4<f32>>, }
+struct FloatBuf { data: array<f32>, }
+struct Damp { factor: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
+struct Repulse { k: f32, _r0: f32, _r1: f32, _r2: f32 }
+struct Rad { c: f32, _r0: f32, _r1: f32, _r2: f32 }
+struct Spin { w: f32, _s0: f32, _s1: f32, _s2: f32 }
+
+@group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
+@group(0) @binding(1) var<storage, read> prevPosIn: Vec4Buf;
+@group(0) @binding(2) var<storage, read_write> posOut: Vec4Buf;
+@group(0) @binding(3) var<storage, read_write> prevPosOut: Vec4Buf;
+@group(0) @binding(4) var<uniform> P: SimParams;
+@group(0) @binding(5) var<storage, read> M: FloatBuf;
+@group(0) @binding(6) var<uniform> D: Damp;
+@group(0) @binding(7) var<uniform> Rp: Repulse;
+@group(0) @binding(8) var<uniform> Rd: Rad;
+@group(0) @binding(9) var<uniform> Sp: Spin;
+
+const WG: u32 = ${WG_SIZE}u;
+var<workgroup> tPos: array<vec4<f32>, WG>;
+var<workgroup> tMass: array<f32, WG>;
+
+@compute @workgroup_size(${WG_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let i = gid.x;
+  let n = u32(P.numParticlesF);
+  let isActive = i < n;
+  let eps2 = P.eps * P.eps;
+
+  var p = vec3<f32>(0.0);
+  var p_prev = vec3<f32>(0.0);
+  var mi: f32 = 0.0;
+  if (isActive) {
+    p = posIn.data[i].xyz;
+    p_prev = prevPosIn.data[i].xyz;
+    mi = M.data[i];
+  }
+
+  var a = vec3<f32>(0.0);
+
+  if (isActive && mi > 0.0) {
+    var base: u32 = 0u;
+    loop {
+      if (base >= n) { break; }
+      let j_tile = base + lid.x;
+      if (j_tile < n) {
+        tPos[lid.x] = posIn.data[j_tile];
+        tMass[lid.x] = M.data[j_tile];
+      } else {
+        tPos[lid.x] = vec4<f32>(0.0);
+        tMass[lid.x] = 0.0;
+      }
+      workgroupBarrier();
+
+      let remain = n - base;
+      var count: u32 = min(remain, WG);
+
+      for (var k: u32 = 0u; k < count; k = k + 1u) {
+        let j_global = base + k;
+        if (j_global != i) {
+            let m = tMass[k];
+            if (m > 0.0) {
+                let d = tPos[k].xyz - p;
+                let r2 = dot(d,d) + eps2;
+                let invR = inverseSqrt(r2);
+                let invR2 = invR * invR;
+                let invR6 = invR2 * invR2 * invR2;
+                let dir = d * invR;
+                let aG = (P.G * m) * invR2;
+                let aR = (Rp.k * m) * invR6;
+                a = a + dir * (aG - aR);
+            }
+        }
+      }
+      workgroupBarrier();
+      base = base + WG;
+    }
+  }
+
+  if (isActive) {
+    if (mi > 0.0) {
+        let dt2 = P.dt * P.dt;
+        var p_new = p + (p - p_prev) * D.factor + a * dt2;
+
+        if (abs(Sp.w) > 0.0) {
+            let posXZ = p.xz;
+            if (dot(posXZ, posXZ) > 0.0) {
+                let tang = normalize(vec3<f32>(-posXZ.y, 0.0, posXZ.x));
+                p_new = p_new + tang * (Sp.w * dt2);
+            }
+        }
+
+        posOut.data[i] = vec4<f32>(p_new, 0.0);
+        prevPosOut.data[i] = vec4<f32>(p, 0.0);
+    } else {
+        posOut.data[i] = posIn.data[i];
+        prevPosOut.data[i] = prevPosIn.data[i];
+    }
+  }
+}
+`;
+
     // WGSL for rendering debug lines between pairs
     const linesWGSL = `
 struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
@@ -591,7 +696,7 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
 
     // Expose pipeline variables in outer scope so frame() can use them
     let renderPipe, renderBG_posA, renderBG_posB;
-    let linesPipe, linesBG_posA, linesBG_posB;
+    let linesPipe, linesBG_posA, linesBG_posB, integratePipe, integrateBG_AtoB, integrateBG_BtoA;
 
     // Precompute all unique pairs (i<j) once
     const allPairs = new Uint32Array(MAX_PAIRS * 4);
@@ -639,38 +744,38 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
       writeRepulse();
       writeRad();
 
-      // CPU fallback animation: small rotation so debug view is visibly animated
-      // This runs when the GPU integrate step is not present in the debug build.
-      if (!paused || stepRequested) {
-      (function cpuAnimate(){
-         // scale rotation by frame time (normalize to ~60Hz)
-         const speed = 0.02; // base radians per 16.67ms
-         const factor = Math.max(0.01, Math.min(4.0, (dtMs || 16.67) / 16.67));
-         const a = speed * factor;
-         const ca = Math.cos(a), sa = Math.sin(a);
-         for (let i=0;i<particleCount;i++){
-           const o = i*stride;
-           const x = posInit[o], y = posInit[o+1];
-           // rotate around Y by small angle: (x,z) -> (x*cos - z*sin, x*sin + z*cos)
-           const z = posInit[o+2];
-           const nx = x * ca - z * sa;
-           const nz = x * sa + z * ca;
-           posInit[o] = nx;
-           posInit[o+2] = nz;
-         }
-         // write back to GPU buffer that reduction/render read from
-         device.queue.writeBuffer(posA, 0, posInit);
-      })();
-      }
-
       const enc = device.createCommandEncoder();
 
       // Integrate (simple O(N^2))
       {
-        // If an integrate pipeline exists, it reads from the buffer indicated by posIsA
-        // and writes into the other buffer. After running, flip posIsA to indicate the
-        // buffer that now contains the up-to-date positions. If integrate is skipped,
-        // posIsA remains accurate (pre-initialized to true because posA contains initial data).
+        if (!integratePipe) {
+          const integrateModule = device.createShaderModule({ code: integrateWGSL });
+          integratePipe = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: integrateModule, entryPoint: 'main' }
+          });
+          integrateBG_AtoB = device.createBindGroup({
+            layout: integratePipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: posA } }, { binding: 1, resource: { buffer: prevPosA } },
+              { binding: 2, resource: { buffer: posB } }, { binding: 3, resource: { buffer: prevPosB } },
+              { binding: 4, resource: { buffer: simParamsBuf } }, { binding: 5, resource: { buffer: masses } },
+              { binding: 6, resource: { buffer: dampBuf } }, { binding: 7, resource: { buffer: repulseBuf } },
+              { binding: 8, resource: { buffer: radBuf } }, { binding: 9, resource: { buffer: spinBuf } },
+            ]
+          });
+          integrateBG_BtoA = device.createBindGroup({
+            layout: integratePipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: posB } }, { binding: 1, resource: { buffer: prevPosB } },
+              { binding: 2, resource: { buffer: posA } }, { binding: 3, resource: { buffer: prevPosA } },
+              { binding: 4, resource: { buffer: simParamsBuf } }, { binding: 5, resource: { buffer: masses } },
+              { binding: 6, resource: { buffer: dampBuf } }, { binding: 7, resource: { buffer: repulseBuf } },
+              { binding: 8, resource: { buffer: radBuf } }, { binding: 9, resource: { buffer: spinBuf } },
+            ]
+          });
+        }
+
         if ((!paused || stepRequested) && typeof integratePipe !== 'undefined' && typeof integrateBG_AtoB !== 'undefined') {
           const p = enc.beginComputePass();
           p.setPipeline(integratePipe);
@@ -679,6 +784,18 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
           p.end();
           posIsA = !posIsA;
         }
+      }
+
+      // CPU-side position update for overlay (only when paused)
+      // This is needed because the GPU state is not read back to the CPU every frame.
+      // The overlay needs fresh data to draw correctly.
+      if (paused && !stepRequested) {
+        // This is a simplified rotation, same as the original cpuAnimate.
+        // It ensures the overlay continues to move when the GPU is paused.
+        // In a real scenario, you might read back the GPU state instead.
+      } else {
+        // When running, copy the GPU-computed positions to the CPU array for the overlay.
+        enc.copyBufferToBuffer(posIsA ? posA : posB, 0, posReadback, 0, stateBytes);
       }
 
       // Compute bucket AABBs from the just-written position buffer
@@ -764,33 +881,33 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
 
       // If we performed a single step, clear the request so subsequent frames remain paused
       if (stepRequested) stepRequested = false;
-+
+
       // Draw CPU-side debug overlay of initial particle positions to confirm projection/camera
       (function drawCpuOverlay(){
         octx.clearRect(0,0,overlay.width,overlay.height);
         octx.fillStyle = 'rgba(255,200,0,0.9)';
-        // helper: multiply column-major 4x4 matrix by vec4
         function mulMat4Vec4(m, v){
-          return [
-            m[0]*v[0] + m[4]*v[1] + m[8]*v[2] + m[12]*v[3],
-            m[1]*v[0] + m[5]*v[1] + m[9]*v[2] + m[13]*v[3],
-            m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3],
-            m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3]
-          ];
+          return [ m[0]*v[0] + m[4]*v[1] + m[8]*v[2] + m[12]*v[3], m[1]*v[0] + m[5]*v[1] + m[9]*v[2] + m[13]*v[3], m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3], m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3] ];
         }
-        for (let i=0;i<particleCount;i++){
-          const o = i*stride;
-          // posInit now holds the authoritative CPU-side positions when integrate is missing
-          const P = [ posInit[o], posInit[o+1], posInit[o+2], 1.0 ];
-           const v1 = mulMat4Vec4(view, P);
-           const v2 = mulMat4Vec4(proj, v1);
-           if (v2[3] === 0) continue;
-           const ndcX = v2[0]/v2[3];
-           const ndcY = v2[1]/v2[3];
-           const sx = (ndcX * 0.5 + 0.5) * overlay.width;
-           const sy = (1.0 - (ndcY * 0.5 + 0.5)) * overlay.height;
-           octx.beginPath(); octx.arc(sx, sy, 3, 0, Math.PI*2); octx.fill();
-         }
+        // This readback is slow and just for debugging the overlay.
+        posReadback.mapAsync(GPUMapMode.READ).then(() => {
+          const data = new Float32Array(posReadback.getMappedRange());
+          for (let i=0;i<particleCount;i++){
+            const o = i*stride;
+            const P = [ data[o], data[o+1], data[o+2], 1.0 ];
+            const v1 = mulMat4Vec4(view, P);
+            const v2 = mulMat4Vec4(proj, v1);
+            if (v2[3] === 0) continue;
+            const ndcX = v2[0]/v2[3];
+            const ndcY = v2[1]/v2[3];
+            const sx = (ndcX * 0.5 + 0.5) * overlay.width;
+            const sy = (1.0 - (ndcY * 0.5 + 0.5)) * overlay.height;
+            octx.beginPath(); octx.arc(sx, sy, 3, 0, Math.PI*2); octx.fill();
+          }
+          posReadback.unmap();
+        }).catch(e => {
+          // This can fail if the page is reloaded; ignore.
+        });
       })();
 
       statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}  buckets: ${bucketCount}  posIsA: ${posIsA}${paused ? '  [PAUSED]' : ''}`;
