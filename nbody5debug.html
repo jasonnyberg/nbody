@@ -116,6 +116,14 @@
     const format = navigator.gpu.getPreferredCanvasFormat();
     const WG_SIZE = 64; // small workgroup for debug
 
+    async function fetchShader(url) {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch shader: ${response.statusText}`);
+      }
+      return response.text();
+    }
+
     function resize() {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
@@ -299,41 +307,8 @@
     const nodeParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(nodeParamsBuf, 0, nodeParams);
 
-    // WGSL: reduction that computes min/max per bucket
-    const reduceWGSL = `
-struct UBO { n: f32, bucket: f32, bucketCount: f32, pad: f32 };
-@group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
-@group(0) @binding(1) var<storage, read_write> nodeBuf: array<vec4f>;
-@group(0) @binding(2) var<uniform> params: UBO;
-
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let k = gid.x;
-  let N = u32(params.n);
-  let bsz = u32(params.bucket);
-  let start = k * bsz;
-  if (start >= N) {
-    // empty slot
-    nodeBuf[2u*k] = vec4f(0.0);
-    nodeBuf[2u*k+1u] = vec4f(0.0);
-    return;
-  }
-  var mn = vec3f(1e30, 1e30, 1e30);
-  var mx = vec3f(-1e30, -1e30, -1e30);
-  let end = min(start + bsz, N);
-  var i = start;
-  loop {
-    let p = posBuf[i].xyz;
-    mn = min(mn, p);
-    mx = max(mx, p);
-    i = i + 1u;
-    if (i >= end) { break; }
-  }
-  nodeBuf[2u*k] = vec4f(mn, 0.0);
-  nodeBuf[2u*k+1u] = vec4f(mx, 0.0);
-}
-`;
-    const reduceModule = device.createShaderModule({ code: reduceWGSL });
+    const reduceCode = await fetchShader('scripts/reduce-debug.wgsl');
+    const reduceModule = device.createShaderModule({ code: reduceCode });
     const reducePipe = device.createComputePipeline({ layout: 'auto', compute: { module: reduceModule, entryPoint: 'main' } });
 
     // Bind groups for reduction (posA/posB)
@@ -350,51 +325,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 
     console.log('DEBUG: reducePipe/bindgroups created', { reducePipe: !!reducePipe, reduceBG_A: !!reduceBG_A, reduceBG_B: !!reduceBG_B });
 
-    // WGSL for rendering boxes as instanced line geometry (24 edges -> 48 vertices per instance)
-    const boxesWGSL = `
-struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
-@group(0) @binding(0) var<storage, read> nodeBuf: array<vec4f>;
-struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
-@group(0) @binding(1) var<uniform> ubo: UBO;
-
-const EDGES : array<u32, 24> = array<u32,24>(
-  0u,1u, 1u,3u, 3u,2u, 2u,0u,  // bottom
-  4u,5u, 5u,7u, 7u,6u, 6u,4u,  // top
-  0u,4u, 1u,5u, 2u,6u, 3u,7u   // verticals
-);
-
-fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
-  let bx = f32((c & 1u));
-  let by = f32(((c >> 1u) & 1u));
-  let bz = f32(((c >> 2u) & 1u));
-  return mn + vec3f(bx, by, bz) * (mx - mn);
-}
-
-@vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
-  var o: VSOut;
-  let edge = vid / 2u;
-  if (u32(iid) >= ${bucketCount}u) {
-    o.pos = vec4f(2.0,2.0,2.0,1.0);
-    o.col = vec4f(0.0);
-    return o;
-  }
-  let a = nodeBuf[2u*iid].xyz;
-  let b = nodeBuf[2u*iid+1u].xyz;
-  let ea = EDGES[edge*2u + 0u];
-  let eb = EDGES[edge*2u + 1u];
-  let endpoint = vid % 2u;
-  let ci = select(ea, eb, endpoint == 1u);
-  let P = cornerPos(ci, a, b);
-  let vp4 = ubo.proj * ubo.view * vec4f(P, 1.0);
-  o.pos = vp4;
-  // color by depth approximation: use teal
-  o.col = vec4f(0.0, 0.8, 1.0, 0.8);
-  return o;
-}
-
-@fragment fn fs(inp: VSOut) -> @location(0) vec4f { return inp.col; }
-`;
-    const boxesModule = device.createShaderModule({ code: boxesWGSL });
+    const boxesCode = await fetchShader('scripts/boxes-debug.wgsl');
+    const boxesModule = device.createShaderModule({ code: boxesCode.replace(/\$\{bucketCount\}/g, bucketCount) });
     const boxesPipe = device.createRenderPipeline({
       layout: 'auto',
       vertex: { module: boxesModule, entryPoint: 'vs' },
@@ -421,257 +353,6 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
        device.queue.writeBuffer(matsBuf, 0, mats);
      }
      writeMats();
-
-    // Render shader used by full build — include here so debug can create the render pipeline
-    const renderWGSL = `
-struct Vec4Buf { data: array<vec4<f32>>, }
-struct FloatBuf { data: array<f32>, }
-struct Mats { m: array<vec4<f32>, 10>, }
-@group(0) @binding(0) var<storage, read> Ppos: Vec4Buf;
-@group(0) @binding(1) var<storage, read> M: FloatBuf;
-@group(0) @binding(2) var<uniform> U: Mats;
-
-struct VSOut {
-  @builtin(position) pos: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-  @location(1) radiate: f32,
-  @location(2) massNorm: f32,
-};
-
-fn loadMat(idx: u32) -> mat4x4<f32> {
-  let b = idx * 4u;
-  return mat4x4<f32>(U.m[b+0u], U.m[b+1u], U.m[b+2u], U.m[b+3u]);
-}
-
-@vertex
-fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
-  // Per-instance particle index
-  let pos4 = Ppos.data[iid];
-  let world = pos4.xyz;
-  let mass = M.data[iid];
-
-  // Cull dead particles (mass <= 0)
-  if (mass <= 0.0) {
-    var out: VSOut;
-    out.pos = vec4<f32>(2.0, 2.0, 1.0, 1.0);
-    out.uv = vec2<f32>(2.0);
-    out.radiate = 0.0;
-    out.massNorm = 0.0;
-    return out;
-  }
-
-  // Corner in NDC pixel space: (-1,-1), (-1,1), (1,-1), (1,1)
-  var corner: vec2<f32>;
-  switch (vid & 3u) {
-    case 0u: { corner = vec2<f32>(-1.0, -1.0); }
-    case 1u: { corner = vec2<f32>(-1.0,  1.0); }
-    case 2u: { corner = vec2<f32>( 1.0, -1.0); }
-    default: { corner = vec2<f32>( 1.0,  1.0); }
-  }
-
-  let proj = loadMat(0u);
-  let view = loadMat(1u);
-  let viewPos = view * vec4<f32>(world, 1.0);
-  let clip = proj * viewPos;
-
-  // Viewport and size parameters packed at U.m[8]: (width, height, sizeScale, invLogMax)
-  let vp = U.m[8u];
-  let width = vp.x; let height = vp.y; let sizeScale = vp.z; let invLogMax = vp.w;
-  // Depth-scaled size similar to nbody3
-  let baseSize = max(1.0, pow(max(mass, 0.0), 0.3333));
-  let sizePx = max(2.0, sizeScale * baseSize / max(1.0, -viewPos.z));
-
-  // Convert pixel offset to clip-space offset (pre-divide), account for clip.w
-  let offsetClip = vec2<f32>(
-    2.0 * corner.x * sizePx / max(1.0, width),
-   -2.0 * corner.y * sizePx / max(1.0, height)
-  ) * clip.w;
-
-  // Mass normalization for color like nbody3
-  let mNorm = clamp(log(1.0 + max(mass, 0.0)) * invLogMax, 0.0, 1.0);
-
-  var out: VSOut;
-  out.pos = vec4<f32>(clip.xy + offsetClip, clip.z, clip.w);
-  out.uv = corner; // pass to fragment for circular mask
-  out.radiate = pos4.w;
-  out.massNorm = mNorm;
-  return out;
-}
-
-@fragment
-fn fs(in: VSOut) -> @location(0) vec4<f32> {
-  let r = length(in.uv);
-  if (r > 1.0) { discard; }
-  // Soft edge alpha
-  let alpha = clamp((1.0 - r) / 0.3, 0.0, 1.0);
-  // Radiative coloring like nbody3: red from radiate, green/blue from mass
-  let redRadiate = clamp(5.0 * in.radiate, 0.0, 1.0);
-  let g = in.massNorm;
-  let b = 1.0 - in.massNorm;
-  return vec4<f32>(redRadiate, g, b, alpha);
-}
-`;
-
-    // WGSL for a simple O(N^2) Verlet integrator
-    const integrateWGSL = `
-struct SimParams { dt: f32, G: f32, eps: f32, numParticlesF: f32 }
-struct Vec4Buf { data: array<vec4<f32>>, }
-struct FloatBuf { data: array<f32>, }
-struct Damp { factor: f32, _pad0: f32, _pad1: f32, _pad2: f32 }
-struct Repulse { k: f32, _r0: f32, _r1: f32, _r2: f32 }
-struct Rad { c: f32, _r0: f32, _r1: f32, _r2: f32 }
-struct Spin { w: f32, _s0: f32, _s1: f32, _s2: f32 }
-
-@group(0) @binding(0) var<storage, read> posIn: Vec4Buf;
-@group(0) @binding(1) var<storage, read> prevPosIn: Vec4Buf;
-@group(0) @binding(2) var<storage, read_write> posOut: Vec4Buf;
-@group(0) @binding(3) var<storage, read_write> prevPosOut: Vec4Buf;
-@group(0) @binding(4) var<uniform> P: SimParams;
-@group(0) @binding(5) var<storage, read> M: FloatBuf;
-@group(0) @binding(6) var<uniform> D: Damp;
-@group(0) @binding(7) var<uniform> Rp: Repulse;
-@group(0) @binding(8) var<uniform> Rd: Rad;
-@group(0) @binding(9) var<uniform> Sp: Spin;
-
-const WG: u32 = ${WG_SIZE}u;
-var<workgroup> tPos: array<vec4<f32>, WG>;
-var<workgroup> tPrevPos: array<vec4<f32>, WG>;
-var<workgroup> tMass: array<f32, WG>;
-
-@compute @workgroup_size(${WG_SIZE})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let i = gid.x;
-  let n = u32(P.numParticlesF);
-  let isActive = i < n;
-  let eps2 = P.eps * P.eps;
-
-  var p = vec3<f32>(0.0);
-  var p_prev = vec3<f32>(0.0);
-  var mi: f32 = 0.0;
-  if (isActive) {
-    p = posIn.data[i].xyz;
-    p_prev = prevPosIn.data[i].xyz;
-    mi = M.data[i];
-  }
-
-  var a = vec3<f32>(0.0);
-  var radiate_mag: f32 = 0.0;
-
-  var base: u32 = 0u;
-  loop {
-    if (base >= n) { break; }
-    let j_tile = base + lid.x;
-    if (j_tile < n) {
-      tPos[lid.x] = posIn.data[j_tile];
-      tPrevPos[lid.x] = prevPosIn.data[j_tile];
-      tMass[lid.x] = M.data[j_tile];
-    } else {
-      tPos[lid.x] = vec4<f32>(0.0);
-      tPrevPos[lid.x] = vec4<f32>(0.0);
-      tMass[lid.x] = 0.0;
-    }
-    workgroupBarrier();
-
-    if (isActive && mi > 0.0) {
-      let remain = n - base;
-      var count: u32 = min(remain, WG);
-
-      for (var k: u32 = 0u; k < count; k = k + 1u) {
-        let j_global = base + k;
-        if (j_global != i) {
-            let m = tMass[k];
-            if (m > 0.0) {
-                let d = tPos[k].xyz - p;
-                let r2 = dot(d,d) + eps2;
-                let invR = inverseSqrt(r2);
-                let invR2 = invR * invR;
-                let invR6 = invR2 * invR2 * invR2;
-                let dir = d * invR;
-                let aG = (P.G * m) * invR2;
-                let aR = (Rp.k * m) * invR6;
-                
-                var aRad: f32 = 0.0;
-                if (aR >= aG) {
-                  let vi = p - p_prev;
-                  let vj = tPos[k].xyz - tPrevPos[k].xyz;
-                  let closingSpeed = dot(d, vi - vj);
-                  aRad = Rd.c * closingSpeed * invR;
-                  radiate_mag = radiate_mag + abs(aRad);
-                }
-                a = a + dir * (aG - aR - aRad);
-            }
-        }
-      }
-    }
-    workgroupBarrier();
-    base = base + WG;
-  }
-
-  if (isActive) {
-    if (mi > 0.0) {
-        let dt2 = P.dt * P.dt;
-        var p_new = p + (p - p_prev) * D.factor + a * dt2;
-
-        if (abs(Sp.w) > 0.0) {
-            let posXZ = p.xz;
-            if (dot(posXZ, posXZ) > 0.0) {
-                let tang = normalize(vec3<f32>(-posXZ.y, 0.0, posXZ.x));
-                p_new = p_new + tang * (Sp.w * dt2);
-            }
-        }
-
-        posOut.data[i] = vec4<f32>(p_new, radiate_mag);
-        prevPosOut.data[i] = vec4<f32>(p, 0.0);
-    } else {
-        posOut.data[i] = posIn.data[i];
-        prevPosOut.data[i] = prevPosIn.data[i];
-    }
-  }
-}
-`;
-
-    // WGSL for rendering debug lines between pairs
-    const linesWGSL = `
-struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
-struct Vec4Buf { data: array<vec4f>, };
-struct Mats { m: array<vec4f, 10>, };
-struct PairCount { count: u32, }
-
-@group(0) @binding(0) var<storage, read> posBuf: Vec4Buf;
-@group(0) @binding(1) var<storage, read> pairBuf: array<vec4u>;
-@group(0) @binding(2) var<uniform> U: Mats;
-@group(0) @binding(3) var<storage, read> pc: PairCount;
-
-fn loadMat(idx: u32) -> mat4x4<f32> {
-  let b = idx * 4u;
-  return mat4x4<f32>(U.m[b+0u], U.m[b+1u], U.m[b+2u], U.m[b+3u]);
-}
-
-@vertex
-fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
-  var o: VSOut;
-  if (iid >= pc.count) {
-    o.pos = vec4f(2.0, 2.0, 2.0, 1.0); // off-screen
-    o.col = vec4f(0.0);
-    return o;
-  }
-
-  let pair = pairBuf[iid];
-  let p_idx = select(pair.x, pair.y, (vid % 2u) == 1u);
-  let P = posBuf.data[p_idx].xyz;
-
-  let proj = loadMat(0u);
-  let view = loadMat(1u);
-  o.pos = proj * view * vec4f(P, 1.0);
-  o.col = vec4f(0.3, 0.3, 0.3, 0.5); // Dim gray for pairs
-  return o;
-}
-
-@fragment
-fn fs(inp: VSOut) -> @location(0) vec4f {
-  return inp.col;
-}
-`;
 
     // Uniforms
     // SimParams is 4 floats (16 bytes): dt, G, eps, num
@@ -761,7 +442,8 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
       // Integrate (simple O(N^2))
       {
         if (!integratePipe) {
-          const integrateModule = device.createShaderModule({ code: integrateWGSL });
+          const integrateCode = await fetchShader('scripts/integrate-debug.wgsl');
+          const integrateModule = device.createShaderModule({ code: integrateCode.replace(/\$\{WG_SIZE\}/g, WG_SIZE) });
           integratePipe = device.createComputePipeline({
             layout: 'auto',
             compute: { module: integrateModule, entryPoint: 'main' }
@@ -832,7 +514,8 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
 
         // Ensure lines pipeline and bind-groups exist
         if (!linesPipe) {
-          const linesModule = device.createShaderModule({ code: linesWGSL });
+          const linesCode = await fetchShader('scripts/lines-debug.wgsl');
+          const linesModule = device.createShaderModule({ code: linesCode });
           linesPipe = device.createRenderPipeline({
             layout: 'auto',
             vertex: { module: linesModule, entryPoint: 'vs' },
@@ -864,6 +547,27 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
         const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0.0,g:0.0,b:0.0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
 
         // Optional: draw sprites if render pipeline exists
+        if (!renderPipe) {
+          const renderCode = await fetchShader('scripts/render-debug.wgsl');
+          const renderModule = device.createShaderModule({ code: renderCode });
+          renderPipe = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: { module: renderModule, entryPoint: 'vs' },
+            fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
+            primitive: { topology: 'triangle-strip', cullMode: 'none' }
+          });
+          renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: posA } },
+            { binding: 1, resource: { buffer: masses } },
+            { binding: 2, resource: { buffer: matsBuf } },
+          ]});
+          renderBG_posB = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: posB } },
+            { binding: 1, resource: { buffer: masses } },
+            { binding: 2, resource: { buffer: matsBuf } },
+          ]});
+        }
+
         if (typeof renderPipe !== 'undefined' && typeof renderBG_posA !== 'undefined') {
           rp.setPipeline(renderPipe);
           rp.setBindGroup(0, posIsA ? renderBG_posA : renderBG_posB);
