@@ -287,7 +287,7 @@
     const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const DUMP_PAIRS_N = 64;
     const pairBufReadback = device.createBuffer({ size: DUMP_PAIRS_N * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const posReadback = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
     // --- Octree-bucket AABB debug (post-sort reduction approximation) ---
     // Partition sorted positions into small buckets in Morton order (for debug we use contiguous buckets)
@@ -535,6 +535,7 @@ struct Spin { w: f32, _s0: f32, _s1: f32, _s2: f32 }
 
 const WG: u32 = ${WG_SIZE}u;
 var<workgroup> tPos: array<vec4<f32>, WG>;
+var<workgroup> tPrevPos: array<vec4<f32>, WG>;
 var<workgroup> tMass: array<f32, WG>;
 
 @compute @workgroup_size(${WG_SIZE})
@@ -554,21 +555,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
   }
 
   var a = vec3<f32>(0.0);
+  var radiate_mag: f32 = 0.0;
 
-  if (isActive && mi > 0.0) {
-    var base: u32 = 0u;
-    loop {
-      if (base >= n) { break; }
-      let j_tile = base + lid.x;
-      if (j_tile < n) {
-        tPos[lid.x] = posIn.data[j_tile];
-        tMass[lid.x] = M.data[j_tile];
-      } else {
-        tPos[lid.x] = vec4<f32>(0.0);
-        tMass[lid.x] = 0.0;
-      }
-      workgroupBarrier();
+  var base: u32 = 0u;
+  loop {
+    if (base >= n) { break; }
+    let j_tile = base + lid.x;
+    if (j_tile < n) {
+      tPos[lid.x] = posIn.data[j_tile];
+      tPrevPos[lid.x] = prevPosIn.data[j_tile];
+      tMass[lid.x] = M.data[j_tile];
+    } else {
+      tPos[lid.x] = vec4<f32>(0.0);
+      tPrevPos[lid.x] = vec4<f32>(0.0);
+      tMass[lid.x] = 0.0;
+    }
+    workgroupBarrier();
 
+    if (isActive && mi > 0.0) {
       let remain = n - base;
       var count: u32 = min(remain, WG);
 
@@ -585,13 +589,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
                 let dir = d * invR;
                 let aG = (P.G * m) * invR2;
                 let aR = (Rp.k * m) * invR6;
-                a = a + dir * (aG - aR);
+                
+                var aRad: f32 = 0.0;
+                if (aR >= aG) {
+                  let vi = p - p_prev;
+                  let vj = tPos[k].xyz - tPrevPos[k].xyz;
+                  let closingSpeed = dot(d, vi - vj);
+                  aRad = Rd.c * closingSpeed * invR;
+                  radiate_mag = radiate_mag + abs(aRad);
+                }
+                a = a + dir * (aG - aR - aRad);
             }
         }
       }
-      workgroupBarrier();
-      base = base + WG;
     }
+    workgroupBarrier();
+    base = base + WG;
   }
 
   if (isActive) {
@@ -607,7 +620,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
             }
         }
 
-        posOut.data[i] = vec4<f32>(p_new, 0.0);
+        posOut.data[i] = vec4<f32>(p_new, radiate_mag);
         prevPosOut.data[i] = vec4<f32>(p, 0.0);
     } else {
         posOut.data[i] = posIn.data[i];
@@ -691,8 +704,7 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
     writeDamp();
 
     // create bind-group placeholders; actual bind-groups use matsBuf which is guaranteed to exist later
-    let boxesBG_A;
-    let boxesBG_B;
+    let boxesBG;
 
     // Expose pipeline variables in outer scope so frame() can use them
     let renderPipe, renderBG_posA, renderBG_posB;
@@ -811,12 +823,8 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
       // Render points + lines
       {
         // Ensure boxes bind-groups exist (matsBuf is ready after writeMats())
-        if (!boxesBG_A) {
-          boxesBG_A = device.createBindGroup({ layout: boxesPipe.getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: nodeBuf } },
-            { binding: 1, resource: { buffer: matsBuf } },
-          ]});
-          boxesBG_B = device.createBindGroup({ layout: boxesPipe.getBindGroupLayout(0), entries: [
+        if (!boxesBG) {
+          boxesBG = device.createBindGroup({ layout: boxesPipe.getBindGroupLayout(0), entries: [
             { binding: 0, resource: { buffer: nodeBuf } },
             { binding: 1, resource: { buffer: matsBuf } },
           ]});
@@ -871,7 +879,7 @@ fn fs(inp: VSOut) -> @location(0) vec4f {
 
         // Draw bucket boxes (12 edges -> 24 vertices per instance) -- boxesPipe is present
         rp.setPipeline(boxesPipe);
-        rp.setBindGroup(0, posIsA ? boxesBG_A : boxesBG_B);
+        rp.setBindGroup(0, boxesBG);
         rp.draw(24, bucketCount);
 
         rp.end();
