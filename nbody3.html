@@ -664,11 +664,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     }
 
     if (hasMass) {
-      // Integrate with acceleration directly (no divide by mi)
-      var v = (vel + (acc + spinAccel) * params.dt) * params.damping;
-      var p = pos + v * params.dt;
-      posOut.data[i] = vec4<f32>(p, radiate_mag);
-      velOut.data[i] = vec4<f32>(v, 0.0);
+      // Leapfrog integration (velocity is staggered, t-dt/2)
+      // v(t+dt/2) = v(t-dt/2) + a(t)*dt
+      var v_new = (vel + (acc + spinAccel) * params.dt) * params.damping;
+      // p(t+dt) = p(t) + v(t+dt/2)*dt
+      var p_new = pos + v_new * params.dt;
+      posOut.data[i] = vec4<f32>(p_new, radiate_mag);
+      velOut.data[i] = vec4<f32>(v_new, 0.0);
     } else {
       // Zero-mass particles: do not integrate, do not act as test particles
       posOut.data[i] = posIn.data[i];
