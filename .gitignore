@@ -1,1 +1,4 @@
 LocalContext
+nbody_modular/dist
+nbody_modular/node_modules
+*package-lock.json

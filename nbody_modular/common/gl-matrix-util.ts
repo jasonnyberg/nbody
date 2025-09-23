@@ -24,7 +24,7 @@ export const mat4 = {
         out[0] = 1; out[5] = 1; out[10] = 1; out[15] = 1;
         return out;
     },
-    lookAt: (out: mat4, eye: ReadonlyVec3, center: ReadonlyVec3, up: ReadonlyVec3): mat4 => {
+    lookAt: (out: mat4, eye: vec3, center: vec3, up: vec3): mat4 => {
         let x0: number, x1: number, x2: number, y0: number, y1: number, y2: number, z0: number, z1: number, z2: number, len: number;
         let eyex = eye[0], eyey = eye[1], eyez = eye[2];
         let upx = up[0], upy = up[1], upz = up[2];
