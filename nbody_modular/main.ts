@@ -41,7 +41,7 @@ export class NBodySimulation {
 
     // Buffers
     private posA!: GPUBuffer; private posB!: GPUBuffer;
-    private prevPosA!: GPUBuffer; private prevPosB!: GPUBuffer;
+    private velA!: GPUBuffer; private velB!: GPUBuffer;
     private masses!: GPUBuffer;
     private simParamsBuf!: GPUBuffer;
     private repulseBuf!: GPUBuffer;
@@ -146,10 +146,12 @@ export class NBodySimulation {
             return buffer;
         };
 
+        const velInit = new Float32Array(particleCount * stride); // All zeros
+
         this.posA = buf(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
         this.posB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        this.prevPosA = buf(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-        this.prevPosB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE });
+        this.velA = buf(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+        this.velB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         this.masses = buf(massInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
 
         this.simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -218,9 +220,9 @@ export class NBodySimulation {
                 const computePass = commandEncoder.beginComputePass();
                 const integrateBG = this.integrateModule.createBindGroup(device, {
                     posIn: this.posIsA ? this.posA : this.posB,
-                    prevPosIn: this.posIsA ? this.prevPosA : this.prevPosB,
+                    velIn: this.posIsA ? this.velA : this.velB,
                     posOut: this.posIsA ? this.posB : this.posA,
-                    prevPosOut: this.posIsA ? this.prevPosB : this.prevPosA,
+                    velOut: this.posIsA ? this.velB : this.velA,
                     simParams: this.simParamsBuf, masses: this.masses, damp: this.dampBuf,
                     repulse: this.repulseBuf, rad: this.radBuf, spin: this.spinBuf
                 });

@@ -1,8 +1,8 @@
 interface IntegrateBuffers {
     posIn: GPUBuffer;
-    prevPosIn: GPUBuffer;
+    velIn: GPUBuffer;
     posOut: GPUBuffer;
-    prevPosOut: GPUBuffer;
+    velOut: GPUBuffer;
     simParams: GPUBuffer;
     masses: GPUBuffer;
     damp: GPUBuffer;
@@ -40,9 +40,9 @@ export class IntegrateModule {
             layout: this.bindGroupLayout,
             entries: [
                 { binding: 0, resource: { buffer: buffers.posIn } },
-                { binding: 1, resource: { buffer: buffers.prevPosIn } },
+                { binding: 1, resource: { buffer: buffers.velIn } },
                 { binding: 2, resource: { buffer: buffers.posOut } },
-                { binding: 3, resource: { buffer: buffers.prevPosOut } },
+                { binding: 3, resource: { buffer: buffers.velOut } },
                 { binding: 4, resource: { buffer: buffers.simParams } },
                 { binding: 5, resource: { buffer: buffers.masses } },
                 { binding: 6, resource: { buffer: buffers.damp } },
