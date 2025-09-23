@@ -1,0 +1,12 @@
+{
+  "name": "nbody-modular",
+  "version": "1.0.0",
+  "description": "Modular N-Body simulation in WebGPU and TypeScript",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@webgpu/types": "^0.1.30"
+  }
+}

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Modular WebGPU N-Body (TypeScript)</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+    canvas { width: 100vw; height: 100vh; display: block; }
+    #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; max-height: 95vh; overflow-y: auto; }
+    #ui label { display:block; margin: 6px 0 2px; }
+  </style>
+</head>
+<body>
+  <canvas id="webgpu-canvas"></canvas>
+  <div id="ui">
+    <!-- UI elements will be created by the simulation script -->
+  </div>
+
+  <script type="module">
+    // After running `npm install` and `npm run build`, the compiled
+    // JavaScript will be in the `dist` directory.
+    import { NBodySimulation } from './dist/main.js';
+
+    (async () => {
+      const canvas = document.getElementById('webgpu-canvas');
+      const uiContainer = document.getElementById('ui');
+      if (!canvas || !uiContainer) {
+        console.error("Could not find canvas or UI container element");
+        return;
+      }
+
+      const simulation = new NBodySimulation(canvas, uiContainer);
+      await simulation.init();
+      simulation.run();
+    })();
+  </script>
+</body>
+</html>
