@@ -9,6 +9,15 @@ export type vec3 = Float32Array;
 export type mat4 = Float32Array;
 export type ReadonlyVec3 = readonly [number, number, number];
 
+function normalize(a: number[] | vec3): number[] {
+    const l = Math.hypot(a[0], a[1], a[2]) || 1;
+    return [a[0] / l, a[1] / l, a[2] / l];
+}
+
+function cross(a: number[] | vec3, b: number[] | vec3): number[] {
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
 export const vec3 = {
     create: (): vec3 => new Float32Array(3),
     fromValues: (x: number, y: number, z: number): vec3 => new Float32Array([x, y, z]),
@@ -25,37 +34,25 @@ export const mat4 = {
         return out;
     },
     lookAt: (out: mat4, eye: vec3, center: vec3, up: vec3): mat4 => {
-        let x0: number, x1: number, x2: number, y0: number, y1: number, y2: number, z0: number, z1: number, z2: number, len: number;
-        let eyex = eye[0], eyey = eye[1], eyez = eye[2];
-        let upx = up[0], upy = up[1], upz = up[2];
-        let centerx = center[0], centery = center[1], centerz = center[2];
-
-        if (Math.abs(eyex - centerx) < EPSILON && Math.abs(eyey - centery) < EPSILON && Math.abs(eyez - centerz) < EPSILON) {
-            return mat4.identity(out);
-        }
-
-        z0 = eyex - centerx; z1 = eyey - centery; z2 = eyez - centerz;
-        len = 1 / Math.hypot(z0, z1, z2);
-        z0 *= len; z1 *= len; z2 *= len;
-
-        x0 = upy * z2 - upz * z1;
-        x1 = upz * z0 - upx * z2;
-        x2 = upx * z1 - upy * z0;
-        len = 1 / Math.hypot(x0, x1, x2);
-        x0 *= len; x1 *= len; x2 *= len;
-
-        y0 = z1 * x2 - z2 * x1;
-        y1 = z2 * x0 - z0 * x2;
-        y2 = z0 * x1 - z1 * x0;
-
-        out[0] = x0; out[1] = y0; out[2] = z0; out[3] = 0;
-        out[4] = x1; out[5] = y1; out[6] = z1; out[7] = 0;
-        out[8] = x2; out[9] = y2; out[10] = z2; out[11] = 0;
-        out[12] = -(x0 * eyex + x1 * eyey + x2 * eyez);
-        out[13] = -(y0 * eyex + y1 * eyey + y2 * eyez);
-        out[14] = -(z0 * eyex + z1 * eyez + z2 * eyez);
+        const f = normalize([center[0] - eye[0], center[1] - eye[1], center[2] - eye[2]]);
+        const s = normalize(cross(f, up));
+        const u = cross(s, f);
+        out[0] = s[0];
+        out[1] = u[0];
+        out[2] = -f[0];
+        out[3] = 0;
+        out[4] = s[1];
+        out[5] = u[1];
+        out[6] = -f[1];
+        out[7] = 0;
+        out[8] = s[2];
+        out[9] = u[2];
+        out[10] = -f[2];
+        out[11] = 0;
+        out[12] = -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]);
+        out[13] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
+        out[14] = (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
         out[15] = 1;
-
         return out;
     },
     perspective: (out: mat4, fovy: number, aspect: number, near: number, far: number): mat4 => {

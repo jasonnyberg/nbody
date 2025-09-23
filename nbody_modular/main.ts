@@ -210,6 +210,7 @@ export class NBodySimulation {
                     return;
                 }
 
+                this.camera.updateViewMatrix();
                 this.updateUniforms();
 
                 const commandEncoder = device.createCommandEncoder();
