@@ -6,15 +6,12 @@
   <style>
     html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
     canvas { width: 100vw; height: 100vh; display: block; }
-    /* Overlay canvas for CPU-side debug rendering */
-    #overlay { position: fixed; left: 0; top: 0; pointer-events: none; width: 100vw; height: 100vh; }
     #ui { position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.6); color: #fff; font-family: system-ui, sans-serif; padding: 10px; font-size: 12px; }
     #ui label { display:block; margin: 6px 0 2px; }
   </style>
 </head>
 <body>
   <canvas id="c"></canvas>
-  <canvas id="overlay"></canvas>
   <div id="ui">
     <div><b>Controls</b></div>
     <label>G: <span id="gVal">0.30</span></label>
@@ -66,10 +63,6 @@
 
     <div id="stats" style="margin-top:6px; opacity: 0.85;"></div>
     <div style="margin-top:6px;">
-      <button id="startStop">Pause</button>
-      <button id="step">Step</button>
-    </div>
-    <div style="margin-top:6px;">
       <button id="dumpPairs">Dump pairs (one frame)</button>
     </div>
   </div>
@@ -78,8 +71,6 @@
   "use strict";
   (async () => {
     const canvas = document.getElementById('c');
-    const overlay = document.getElementById('overlay');
-    const octx = overlay.getContext('2d');
     const statsDiv = document.getElementById('stats');
     if (!('gpu' in navigator)) { alert('WebGPU not supported'); return; }
 
@@ -101,11 +92,6 @@
           device = await adapter.requestDevice();
         }
       }
-      // Debug: log uncaptured GPU errors to console to help diagnose why nothing renders
-      if (device) {
-        try { device.addEventListener('uncapturederror', (ev) => console.error('GPU uncap error', ev)); } catch (e) {}
-        try { device.onuncapturederror = (ev) => console.error('GPU onuncapturederror', ev); } catch (e) {}
-      }
     } catch (e) {
       console.warn('requestDevice failed, cannot continue:', e);
       alert('Unable to initialize GPU device');
@@ -116,20 +102,10 @@
     const format = navigator.gpu.getPreferredCanvasFormat();
     const WG_SIZE = 64; // small workgroup for debug
 
-    async function fetchShader(url) {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`Failed to fetch shader: ${response.statusText}`);
-      }
-      return response.text();
-    }
-
     function resize() {
       const dpr = Math.max(1, window.devicePixelRatio || 1);
       canvas.width = Math.floor(canvas.clientWidth * dpr);
       canvas.height = Math.floor(canvas.clientHeight * dpr);
-      overlay.width = canvas.width;
-      overlay.height = canvas.height;
       context.configure({ device, format, alphaMode: 'opaque' });
     }
     resize();
@@ -295,101 +271,253 @@
     const pairCountReadback = device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const DUMP_PAIRS_N = 64;
     const pairBufReadback = device.createBuffer({ size: DUMP_PAIRS_N * 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const posReadback = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-
-    // --- Octree-bucket AABB debug (post-sort reduction approximation) ---
-    // Partition sorted positions into small buckets in Morton order (for debug we use contiguous buckets)
-    const BUCKET_SIZE = 4; // tune for debug; smaller -> more boxes
-    const bucketCount = Math.ceil(particleCount / BUCKET_SIZE);
-    // nodeBuf holds min(vec4) then max(vec4) per bucket (2 vec4 per bucket)
-    const nodeBuf = device.createBuffer({ size: bucketCount * 2 * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
-    const nodeParams = new Float32Array([particleCount, BUCKET_SIZE, bucketCount, 0]);
-    const nodeParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    device.queue.writeBuffer(nodeParamsBuf, 0, nodeParams);
-
-    const reduceCode = await fetchShader('scripts/reduce-debug.wgsl');
-    const reduceModule = device.createShaderModule({ code: reduceCode });
-    const reducePipe = device.createComputePipeline({ layout: 'auto', compute: { module: reduceModule, entryPoint: 'main' } });
-
-    // Bind groups for reduction (posA/posB)
-    const reduceBG_A = device.createBindGroup({ layout: reducePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posA } },
-      { binding: 1, resource: { buffer: nodeBuf } },
-      { binding: 2, resource: { buffer: nodeParamsBuf } },
-    ]});
-    const reduceBG_B = device.createBindGroup({ layout: reducePipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: posB } },
-      { binding: 1, resource: { buffer: nodeBuf } },
-      { binding: 2, resource: { buffer: nodeParamsBuf } },
-    ]});
-
-    console.log('DEBUG: reducePipe/bindgroups created', { reducePipe: !!reducePipe, reduceBG_A: !!reduceBG_A, reduceBG_B: !!reduceBG_B });
-
-    const boxesCode = await fetchShader('scripts/boxes-debug.wgsl');
-    const boxesModule = device.createShaderModule({ code: boxesCode.replace(/\$\{bucketCount\}/g, bucketCount) });
-    const boxesPipe = device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: boxesModule, entryPoint: 'vs' },
-      fragment: { module: boxesModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
-      primitive: { topology: 'line-list', cullMode: 'none' }
-    });
-
-    // NOTE: matsBuf is declared later; avoid referencing it here to prevent TDZ ReferenceError.
-    console.log('DEBUG: boxesPipe created', { boxesPipe: !!boxesPipe, nodeBufSize: bucketCount * 2 * 16 });
-
-    // Matrices + viewport params in a 10-vec4 uniform for alignment (used by renderers and box shader)
-    let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
-     const mats = new Float32Array(40); // 10 * vec4
-     const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-     function writeMats() {
-       proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
-       updateView();
-       mats.set(proj, 0);
-       mats.set(view, 16);
-       mats[32] = canvas.width;  // viewport W
-       mats[33] = canvas.height; // viewport H
-       mats[34] = 18.0;          // sprite sizeScale in pixels
-       mats[35] = 1.0 / Math.log(1.0 + 8.0); // inverse log(maxMass+1)
-       device.queue.writeBuffer(matsBuf, 0, mats);
-     }
-     writeMats();
+    const posReadback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
 
     // Uniforms
-    // SimParams is 4 floats (16 bytes): dt, G, eps, num
-    const simParams = new Float32Array([dt, G, 1.0, particleCount]); // eps defaults to 1.0
+    const simParams = new Float32Array([dt, G, 4.0, particleCount]); // eps defaults to 4.0
     const simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeSimParams(){ device.queue.writeBuffer(simParamsBuf, 0, simParams.buffer, simParams.byteOffset, simParams.byteLength); }
     writeSimParams();
 
-    // New: repulsion (R) uniform
+    const restParams = new Float32Array([restitution, 0,0,0]);
+    const restBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRest(){ restParams[0]=restitution; device.queue.writeBuffer(restBuf, 0, restParams); }
+    writeRest();
+
+    const radiusParams = new Float32Array([radiusFactor, 1.0, 0, 0]);
+    const radiusBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeRadius(){ radiusParams[0]=radiusFactor; device.queue.writeBuffer(radiusBuf, 0, radiusParams); }
+    writeRadius();
+
+    const approachEl = document.getElementById('approach');
+    approachEl.addEventListener('input', () => {
+      const v = approachEl.checked ? 1.0 : 0.0;
+      radiusParams[1] = v; device.queue.writeBuffer(radiusBuf, 0, radiusParams);
+    });
+    radiusParams[1] = approachEl.checked ? 1.0 : 0.0;
+    device.queue.writeBuffer(radiusBuf, 0, radiusParams);
+    window.setApproachOnly = (on) => { approachEl.checked = !!on; approachEl.dispatchEvent(new Event('input')); };
+
+    const dumpBtn = document.getElementById('dumpPairs');
+    dumpBtn.addEventListener('click', async () => {
+      try {
+        const dbgEnc = device.createCommandEncoder();
+        dbgEnc.copyBufferToBuffer(outPairCount, 0, pairCountReadback, 0, 4);
+        dbgEnc.copyBufferToBuffer(visPairBuf, 0, pairBufReadback, 0, DUMP_PAIRS_N * 16);
+        device.queue.submit([dbgEnc.finish()]);
+        await pairCountReadback.mapAsync(GPUMapMode.READ);
+        await pairBufReadback.mapAsync(GPUMapMode.READ);
+        const cnt = new Uint32Array(pairCountReadback.getMappedRange())[0];
+        const pairs = new Uint32Array(pairBufReadback.getMappedRange());
+        const out = [];
+        const m = Math.min(DUMP_PAIRS_N, cnt);
+        for (let i=0;i<m;i++) out.push([pairs[i*4+0], pairs[i*4+1], pairs[i*4+2], pairs[i*4+3]]);
+        console.log('Dump pairs:', cnt, out);
+        pairCountReadback.unmap(); pairBufReadback.unmap();
+      } catch (e) { console.warn('dump pairs failed', e); }
+    });
+
+    const dampParams = new Float32Array([damping, 0,0,0]);
+    const dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeDamp(){ dampParams[0]=damping; device.queue.writeBuffer(dampBuf, 0, dampParams); }
+    writeDamp();
+
+    const spinParams = new Float32Array([spin, 0,0,0]);
+    const spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeSpin(){ spinParams[0]=spin; device.queue.writeBuffer(spinBuf, 0, spinParams); }
+    writeSpin();
+
     const repulseParams = new Float32Array([R, 0,0,0]);
     const repulseBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeRepulse(){ repulseParams[0]=R; device.queue.writeBuffer(repulseBuf, 0, repulseParams); }
     writeRepulse();
 
-    // New: radiative damping uniform
     const radParams = new Float32Array([radiativeDamping, 0,0,0]);
     const radBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     function writeRad(){ radParams[0]=radiativeDamping; device.queue.writeBuffer(radBuf, 0, radParams); }
     writeRad();
 
-    // Add spin and damping uniforms + writers so UI callbacks have functions to call
-    const spinParams = new Float32Array([spin, 0, 0, 0]);
-    const spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeSpin() { spinParams[0] = spin; device.queue.writeBuffer(spinBuf, 0, spinParams); }
-    writeSpin();
+    // Matrices + viewport params in a 10-vec4 uniform for alignment
+    let proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
+    const mats = new Float32Array(36); // proj(16) + view(16) + vp(vec4)
+    const matsBuf = device.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    function writeMats() {
+      proj = perspective(Math.PI/4, canvas.width/canvas.height, 0.1, 1e7);
+      updateView();
+      mats.set(proj, 0);
+      mats.set(view, 16);
+      mats[32] = canvas.width;  // viewport W
+      mats[33] = canvas.height; // viewport H
+      mats[34] = 18.0;          // sprite sizeScale in pixels
+      mats[35] = 0.0;           // padding/unused
+      device.queue.writeBuffer(matsBuf, 0, mats);
+    }
+    writeMats();
 
-    const dampParams = new Float32Array([damping, 0, 0, 0]);
-    const dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    function writeDamp() { dampParams[0] = damping; device.queue.writeBuffer(dampBuf, 0, dampParams); }
-    writeDamp();
+    // WGSL Shaders (inline)
+    const renderWGSL = /* wgsl */`
+struct VSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) color: vec4f,
+};
+@group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
+@group(0) @binding(1) var<storage, read> massBuf: array<f32>;
+struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
+@group(0) @binding(2) var<uniform> ubo: UBO;
 
-    // create bind-group placeholders; actual bind-groups use matsBuf which is guaranteed to exist later
-    let boxesBG;
+fn getCorner(i: u32) -> vec2f {
+  return select(vec2f(-1.0, -1.0), select(vec2f(1.0, -1.0), select(vec2f(-1.0, 1.0), vec2f(1.0,1.0), i==3u), i==2u), i==1u);
+}
 
-    // Expose pipeline variables in outer scope so frame() can use them
-    let renderPipe, renderBG_posA, renderBG_posB;
-    let linesPipe, linesBG_posA, linesBG_posB, integratePipe, integrateBG_AtoB, integrateBG_BtoA;
+@vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
+  let P = posBuf[iid];
+  let mass = massBuf[iid];
+  let vp4 = ubo.proj * ubo.view * vec4f(P.xyz, 1.0);
+  let w = ubo.vp.x;
+  let h = ubo.vp.y;
+  let baseSize = ubo.vp.z;
+  let sizePx = baseSize * pow(max(mass, 1.0), 0.3333);
+  let offs = getCorner(vid);
+  let offsClip = vec2f(2.0 * sizePx / w, 2.0 * sizePx / h) * offs;
+  var o: VSOut;
+  o.pos = vec4f(vp4.xy + offsClip * vp4.w, vp4.z, vp4.w);
+  o.color = vec4f(0.2, 1.0, 1.0, 0.9);
+  return o;
+}
+
+@fragment fn fs(inp: VSOut) -> @location(0) vec4f {
+  return inp.color;
+}
+`;
+
+    const linesWGSL = /* wgsl */`
+struct VSOut { @builtin(position) pos: vec4f, @location(0) col: vec4f };
+@group(0) @binding(0) var<storage, read> posBuf: array<vec4f>;
+@group(0) @binding(1) var<storage, read> pairs: array<vec4u>;
+struct UBO { proj: mat4x4f, view: mat4x4f, vp: vec4f };
+@group(0) @binding(2) var<uniform> ubo: UBO;
+@group(0) @binding(3) var<storage, read> pairCountBuf: array<u32>; // [0] = count
+
+fn projView(p: vec3f) -> vec4f {
+  return ubo.proj * ubo.view * vec4f(p, 1.0);
+}
+
+@vertex fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSOut {
+  let count = pairCountBuf[0];
+  var o: VSOut;
+  if (iid >= count) {
+    o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+    o.col = vec4f(0.0);
+    return o;
+  }
+  let pr = pairs[iid];
+  let i = pr.x; let j = pr.y;
+  let a = posBuf[i].xyz;
+  let b = posBuf[j].xyz;
+  let col = vec3f(1.0, 0.6, 0.1);
+  let P = select(a, b, vid == 1u);
+  o.pos = projView(P);
+  o.col = vec4f(col, 0.9);
+  return o;
+}
+
+@fragment fn fs(inp: VSOut) -> @location(0) vec4f { return inp.col; }
+`;
+
+    const integrateWGSL = /* wgsl */`
+struct Sim { dt: f32, G: f32, eps: f32, n: f32 };
+@group(0) @binding(0) var<storage, read> posIn: array<vec4f>;
+@group(0) @binding(1) var<storage, read> prevIn: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> posOut: array<vec4f>;
+@group(0) @binding(3) var<storage, read_write> prevOut: array<vec4f>;
+@group(0) @binding(4) var<uniform> sim: Sim;
+@group(0) @binding(5) var<storage, read> masses: array<f32>;
+@group(0) @binding(6) var<uniform> dampU: vec4f;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  let N = u32(sim.n);
+  if (i >= N) { return; }
+  let Pi = posIn[i].xyz;
+  var a = vec3f(0.0);
+  for (var j: u32 = 0u; j < N; j++) {
+    if (j == i) { continue; }
+    let r = posIn[j].xyz - Pi;
+    let d2 = max(dot(r, r), sim.eps * sim.eps);
+    let inv = inverseSqrt(d2 * d2 * d2);
+    a += (sim.G * masses[j]) * r * inv;
+  }
+  let dt2 = sim.dt * sim.dt;
+  let next = Pi + (Pi - prevIn[i].xyz) * dampU.x + a * dt2;
+  prevOut[i] = vec4f(Pi, 0.0);
+  posOut[i] = vec4f(next, 0.0);
+}
+`;
+
+    // Pipelines
+    const renderModule = device.createShaderModule({ code: renderWGSL });
+    const renderPipe = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: renderModule, entryPoint: 'vs' },
+      fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
+      primitive: { topology: 'triangle-strip', cullMode: 'none' }
+    });
+
+    const linesModule = device.createShaderModule({ code: linesWGSL });
+    const linesPipe = device.createRenderPipeline({
+      layout: 'auto',
+      vertex: { module: linesModule, entryPoint: 'vs' },
+      fragment: { module: linesModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
+      primitive: { topology: 'line-list', cullMode: 'none' }
+    });
+
+    const integrateModule = device.createShaderModule({ code: integrateWGSL });
+    const integratePipe = device.createComputePipeline({ layout: 'auto', compute: { module: integrateModule, entryPoint: 'main' } });
+
+    // Bind groups
+    const renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: masses } },
+      { binding: 2, resource: { buffer: matsBuf } },
+    ]});
+    const renderBG_posB = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: masses } },
+      { binding: 2, resource: { buffer: matsBuf } },
+    ]});
+
+    const linesBG_posA = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: visPairBuf } },
+      { binding: 2, resource: { buffer: matsBuf } },
+      { binding: 3, resource: { buffer: outPairCount } },
+    ]});
+    const linesBG_posB = device.createBindGroup({ layout: linesPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: visPairBuf } },
+      { binding: 2, resource: { buffer: matsBuf } },
+      { binding: 3, resource: { buffer: outPairCount } },
+    ]});
+
+    const integrateBG_AtoB = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posA } },
+      { binding: 1, resource: { buffer: prevPosA } },
+      { binding: 2, resource: { buffer: posB } },
+      { binding: 3, resource: { buffer: prevPosB } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+    ]});
+    const integrateBG_BtoA = device.createBindGroup({ layout: integratePipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: posB } },
+      { binding: 1, resource: { buffer: prevPosB } },
+      { binding: 2, resource: { buffer: posA } },
+      { binding: 3, resource: { buffer: prevPosA } },
+      { binding: 4, resource: { buffer: simParamsBuf } },
+      { binding: 5, resource: { buffer: masses } },
+      { binding: 6, resource: { buffer: dampBuf } },
+    ]});
 
     // Precompute all unique pairs (i<j) once
     const allPairs = new Uint32Array(MAX_PAIRS * 4);
@@ -408,25 +536,8 @@
     device.queue.writeBuffer(outPairCount, 0, new Uint32Array([pIdx]));
 
     // Frame loop
-    // Track which buffer currently contains the up-to-date particle positions.
-    // posIsA === true -> posA holds current positions; false -> posB holds current positions.
-    let posIsA = true;
+    let readFromA = true;
     let lastT = performance.now();
-
-    // Simulation control state
-    let paused = false;
-    let stepRequested = false;
-    const startStopBtn = document.getElementById('startStop');
-    const stepBtn = document.getElementById('step');
-    startStopBtn.addEventListener('click', () => {
-      paused = !paused;
-      startStopBtn.textContent = paused ? 'Start' : 'Pause';
-    });
-    stepBtn.addEventListener('click', () => {
-      // Ensure we're paused before stepping; request a single step
-      if (!paused) { paused = true; startStopBtn.textContent = 'Start'; }
-      stepRequested = true;
-    });
 
     async function frame() {
       const now = performance.now();
@@ -441,188 +552,30 @@
 
       // Integrate (simple O(N^2))
       {
-        if (!integratePipe) {
-          const integrateCode = await fetchShader('scripts/integrate-debug.wgsl');
-          const integrateModule = device.createShaderModule({ code: integrateCode.replace(/\$\{WG_SIZE\}/g, WG_SIZE) });
-          integratePipe = device.createComputePipeline({
-            layout: 'auto',
-            compute: { module: integrateModule, entryPoint: 'main' }
-          });
-          integrateBG_AtoB = device.createBindGroup({
-            layout: integratePipe.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: { buffer: posA } }, { binding: 1, resource: { buffer: prevPosA } },
-              { binding: 2, resource: { buffer: posB } }, { binding: 3, resource: { buffer: prevPosB } },
-              { binding: 4, resource: { buffer: simParamsBuf } }, { binding: 5, resource: { buffer: masses } },
-              { binding: 6, resource: { buffer: dampBuf } }, { binding: 7, resource: { buffer: repulseBuf } },
-              { binding: 8, resource: { buffer: radBuf } }, { binding: 9, resource: { buffer: spinBuf } },
-            ]
-          });
-          integrateBG_BtoA = device.createBindGroup({
-            layout: integratePipe.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: { buffer: posB } }, { binding: 1, resource: { buffer: prevPosB } },
-              { binding: 2, resource: { buffer: posA } }, { binding: 3, resource: { buffer: prevPosA } },
-              { binding: 4, resource: { buffer: simParamsBuf } }, { binding: 5, resource: { buffer: masses } },
-              { binding: 6, resource: { buffer: dampBuf } }, { binding: 7, resource: { buffer: repulseBuf } },
-              { binding: 8, resource: { buffer: radBuf } }, { binding: 9, resource: { buffer: spinBuf } },
-            ]
-          });
-        }
-
-        if ((!paused || stepRequested) && typeof integratePipe !== 'undefined' && typeof integrateBG_AtoB !== 'undefined') {
-          const p = enc.beginComputePass();
-          p.setPipeline(integratePipe);
-          p.setBindGroup(0, posIsA ? integrateBG_AtoB : integrateBG_BtoA);
-          p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
-          p.end();
-          posIsA = !posIsA;
-        }
-      }
-
-      // CPU-side position update for overlay (only when paused)
-      // This is needed because the GPU state is not read back to the CPU every frame.
-      // The overlay needs fresh data to draw correctly.
-      if (paused && !stepRequested) {
-        // This is a simplified rotation, same as the original cpuAnimate.
-        // It ensures the overlay continues to move when the GPU is paused.
-        // In a real scenario, you might read back the GPU state instead.
-      } else {
-        // When running, copy the GPU-computed positions to the CPU array for the overlay.
-        enc.copyBufferToBuffer(posIsA ? posA : posB, 0, posReadback, 0, stateBytes);
-      }
-
-      // Compute bucket AABBs from the just-written position buffer
-      {
-        const rp = enc.beginComputePass();
-        rp.setPipeline(reducePipe);
-        // Use the buffer that currently holds the up-to-date positions (posIsA)
-        rp.setBindGroup(0, posIsA ? reduceBG_A : reduceBG_B);
-        rp.dispatchWorkgroups(bucketCount);
-        rp.end();
+        const p = enc.beginComputePass();
+        p.setPipeline(integratePipe);
+        p.setBindGroup(0, readFromA ? integrateBG_AtoB : integrateBG_BtoA);
+        p.dispatchWorkgroups(Math.ceil(particleCount / WG_SIZE));
+        p.end();
+        readFromA = !readFromA;
       }
 
       // Render points + lines
       {
-        // Ensure boxes bind-groups exist (matsBuf is ready after writeMats())
-        if (!boxesBG) {
-          boxesBG = device.createBindGroup({ layout: boxesPipe.getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: nodeBuf } },
-            { binding: 1, resource: { buffer: matsBuf } },
-          ]});
-        }
-
-        // Ensure lines pipeline and bind-groups exist
-        if (!linesPipe) {
-          const linesCode = await fetchShader('scripts/lines-debug.wgsl');
-          const linesModule = device.createShaderModule({ code: linesCode });
-          linesPipe = device.createRenderPipeline({
-            layout: 'auto',
-            vertex: { module: linesModule, entryPoint: 'vs' },
-            fragment: { module: linesModule, entryPoint: 'fs', targets: [{ format, blend: {
-              color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' }
-            } }] },
-            primitive: { topology: 'line-list' }
-          });
-          linesBG_posA = device.createBindGroup({
-            layout: linesPipe.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: { buffer: posA } },
-              { binding: 1, resource: { buffer: visPairBuf } },
-              { binding: 2, resource: { buffer: matsBuf } },
-              { binding: 3, resource: { buffer: outPairCount } },
-            ]});
-          linesBG_posB = device.createBindGroup({
-            layout: linesPipe.getBindGroupLayout(0),
-            entries: [
-              { binding: 0, resource: { buffer: posB } },
-              { binding: 1, resource: { buffer: visPairBuf } },
-              { binding: 2, resource: { buffer: matsBuf } },
-              { binding: 3, resource: { buffer: outPairCount } },
-            ]});
-        }
-
         const viewTex = context.getCurrentTexture().createView();
-        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0.0,g:0.0,b:0.0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
-
-        // Optional: draw sprites if render pipeline exists
-        if (!renderPipe) {
-          const renderCode = await fetchShader('scripts/render-debug.wgsl');
-          const renderModule = device.createShaderModule({ code: renderCode });
-          renderPipe = device.createRenderPipeline({
-            layout: 'auto',
-            vertex: { module: renderModule, entryPoint: 'vs' },
-            fragment: { module: renderModule, entryPoint: 'fs', targets: [{ format, blend: { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' } } }] },
-            primitive: { topology: 'triangle-strip', cullMode: 'none' }
-          });
-          renderBG_posA = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: posA } },
-            { binding: 1, resource: { buffer: masses } },
-            { binding: 2, resource: { buffer: matsBuf } },
-          ]});
-          renderBG_posB = device.createBindGroup({ layout: renderPipe.getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: posB } },
-            { binding: 1, resource: { buffer: masses } },
-            { binding: 2, resource: { buffer: matsBuf } },
-          ]});
-        }
-
-        if (typeof renderPipe !== 'undefined' && typeof renderBG_posA !== 'undefined') {
-          rp.setPipeline(renderPipe);
-          rp.setBindGroup(0, posIsA ? renderBG_posA : renderBG_posB);
-          rp.draw(4, particleCount);
-        }
-
-        // Optional: draw debug pairs if lines pipeline exists
-        if (typeof linesPipe !== 'undefined' && typeof linesBG_posA !== 'undefined') {
-          rp.setPipeline(linesPipe);
-          rp.setBindGroup(0, posIsA ? linesBG_posA : linesBG_posB);
-          rp.draw(2, MAX_PAIRS);
-        }
-
-        // Draw bucket boxes (12 edges -> 24 vertices per instance) -- boxesPipe is present
-        rp.setPipeline(boxesPipe);
-        rp.setBindGroup(0, boxesBG);
-        rp.draw(24, bucketCount);
-
+        const rp = enc.beginRenderPass({ colorAttachments: [{ view: viewTex, clearValue: {r:0,g:0,b:0,a:1}, loadOp: 'clear', storeOp: 'store' }] });
+        rp.setPipeline(renderPipe);
+        rp.setBindGroup(0, readFromA ? renderBG_posA : renderBG_posB);
+        rp.draw(4, particleCount);
+        rp.setPipeline(linesPipe);
+        rp.setBindGroup(0, readFromA ? linesBG_posA : linesBG_posB);
+        rp.draw(2, MAX_PAIRS);
         rp.end();
       }
 
       device.queue.submit([enc.finish()]);
 
-      // If we performed a single step, clear the request so subsequent frames remain paused
-      if (stepRequested) stepRequested = false;
-
-      // Draw CPU-side debug overlay of initial particle positions to confirm projection/camera
-      (function drawCpuOverlay(){
-        octx.clearRect(0,0,overlay.width,overlay.height);
-        octx.fillStyle = 'rgba(255,200,0,0.9)';
-        function mulMat4Vec4(m, v){
-          return [ m[0]*v[0] + m[4]*v[1] + m[8]*v[2] + m[12]*v[3], m[1]*v[0] + m[5]*v[1] + m[9]*v[2] + m[13]*v[3], m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3], m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3] ];
-        }
-        // This readback is slow and just for debugging the overlay.
-        posReadback.mapAsync(GPUMapMode.READ).then(() => {
-          const data = new Float32Array(posReadback.getMappedRange());
-          for (let i=0;i<particleCount;i++){
-            const o = i*stride;
-            const P = [ data[o], data[o+1], data[o+2], 1.0 ];
-            const v1 = mulMat4Vec4(view, P);
-            const v2 = mulMat4Vec4(proj, v1);
-            if (v2[3] === 0) continue;
-            const ndcX = v2[0]/v2[3];
-            const ndcY = v2[1]/v2[3];
-            const sx = (ndcX * 0.5 + 0.5) * overlay.width;
-            const sy = (1.0 - (ndcY * 0.5 + 0.5)) * overlay.height;
-            octx.beginPath(); octx.arc(sx, sy, 3, 0, Math.PI*2); octx.fill();
-          }
-          posReadback.unmap();
-        }).catch(e => {
-          // This can fail if the page is reloaded; ignore.
-        });
-      })();
-
-      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}  buckets: ${bucketCount}  posIsA: ${posIsA}${paused ? '  [PAUSED]' : ''}`;
+      statsDiv.textContent = `fps: ${(1000/Math.max(1, dtMs)).toFixed(0)}  particles: ${particleCount}  pairs: ${MAX_PAIRS}`;
       requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
