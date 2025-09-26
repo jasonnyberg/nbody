@@ -1,0 +1,1 @@
+// Placeholder for Barnes-Hut integration shader

@@ -1,0 +1,1 @@
+// Placeholder for Barnes-Hut boxes visualization shader

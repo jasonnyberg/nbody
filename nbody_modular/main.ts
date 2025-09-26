@@ -3,6 +3,7 @@ import { OrbitCamera } from './common/camera.js';
 import { mat4 } from './common/gl-matrix-util.js';
 import { IPipeline } from './pipelines/pipeline.js';
 import { DirectSumPipeline } from './pipelines/direct_sum/DirectSumPipeline.js';
+import { BarnesHutPipeline } from './pipelines/barnes_hut/BarnesHutPipeline.js';
 
 export interface SimParams {
     particleCount: number;
@@ -29,6 +30,7 @@ export class NBodySimulation {
     private stepRequested: boolean;
 
     private activePipeline!: IPipeline;
+    private pipelineName: string = 'direct_sum';
 
     // Core Buffers
     private posA!: GPUBuffer; private posB!: GPUBuffer;
@@ -80,10 +82,17 @@ export class NBodySimulation {
         this.createBuffers();
         this.setupUI();
 
-        this.activePipeline = new DirectSumPipeline();
+        switch (this.pipelineName) {
+            case 'direct_sum':
+                this.activePipeline = new DirectSumPipeline();
+                break;
+            case 'barnes_hut':
+                this.activePipeline = new BarnesHutPipeline();
+                break;
+        }
         await this.activePipeline.init(device, format, this.params);
 
-        console.log("N-Body Simulation Initialized");
+        console.log(`N-Body Simulation Initialized with ${this.pipelineName} pipeline`);
     }
 
     private createBuffers(): void {
@@ -232,8 +241,8 @@ export class NBodySimulation {
             <div style="margin-top:6px;">
               <label>Pipeline:
                 <select id="pipeline">
-                  <option value="direct_sum" selected>Direct Sum</option>
-                  <option value="barnes_hut" disabled>Barnes-Hut (Not Implemented)</option>
+                  <option value="direct_sum">Direct Sum</option>
+                  <option value="barnes_hut" selected>Barnes-Hut</option>
                 </select>
               </label>
             </div>
@@ -269,8 +278,8 @@ export class NBodySimulation {
         });
 
         document.getElementById('pipeline')?.addEventListener('change', (e) => {
-            const selectedPipeline = (e.target as HTMLSelectElement).value;
-            // TODO: Implement pipeline switching logic
+            this.pipelineName = (e.target as HTMLSelectElement).value;
+            this.init();
         });
     }
 }
