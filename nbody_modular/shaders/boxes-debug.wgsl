@@ -34,7 +34,7 @@ fn cornerPos(c: u32, mn: vec3f, mx: vec3f) -> vec3f {
   let vp4 = ubo.proj * ubo.view * vec4f(P, 1.0);
   o.pos = vp4;
   // color by depth approximation: use teal
-  o.col = vec4f(0.0, 0.8, 1.0, 0.8);
+  o.col = vec4f(0.0, 0.8, 1.0, 0.25);
   return o;
 }
 
