@@ -30,7 +30,7 @@ export class NBodySimulation {
     private stepRequested: boolean;
 
     private activePipeline!: IPipeline;
-    private pipelineName: string = 'direct_sum';
+    private pipelineName: string = 'barnes_hut';
 
     // Core Buffers
     private posA!: GPUBuffer; private posB!: GPUBuffer;
@@ -132,9 +132,9 @@ export class NBodySimulation {
         const velInit = new Float32Array(particleCount * stride); // All zeros
 
         this.posA = buf(posInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-        this.posB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        this.posB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         this.velA = buf(velInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
-        this.velB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        this.velB = device.createBuffer({ size: stateBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         this.masses = buf(massInit, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
 
         this.simParamsBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -171,18 +171,19 @@ export class NBodySimulation {
 
     public run(): void {
         const frame = () => {
+            requestAnimationFrame(frame);
+
+            const { device, context } = this.webgpuContext;
+            if (!device || !context) {
+                return;
+            }
+
+            this.camera.updateViewMatrix();
+            this.updateUniforms();
+
+            const commandEncoder = device.createCommandEncoder();
+
             if (!this.paused || this.stepRequested) {
-                const { device, context } = this.webgpuContext;
-                if (!device || !context) {
-                    requestAnimationFrame(frame);
-                    return;
-                }
-
-                this.camera.updateViewMatrix();
-                this.updateUniforms();
-
-                const commandEncoder = device.createCommandEncoder();
-
                 this.activePipeline.run(commandEncoder, {
                     posIn: this.posIsA ? this.posA : this.posB,
                     velIn: this.posIsA ? this.velA : this.velB,
@@ -196,24 +197,22 @@ export class NBodySimulation {
                     spin: this.spinBuf,
                 }, this.params);
 
-                const renderPass = commandEncoder.beginRenderPass({
-                    colorAttachments: [{
-                        view: context.getCurrentTexture().createView(),
-                        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-                        loadOp: 'clear', storeOp: 'store'
-                    }]
-                });
-
-                this.activePipeline.render(renderPass, this.posIsA ? this.posB : this.posA, this.masses, this.matsBuf, this.params);
-
-                renderPass.end();
-                device.queue.submit([commandEncoder.finish()]);
-
                 this.posIsA = !this.posIsA;
                 this.stepRequested = false;
             }
 
-            requestAnimationFrame(frame);
+            const renderPass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(),
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                    loadOp: 'clear', storeOp: 'store'
+                }]
+            });
+
+            this.activePipeline.render(renderPass, this.posIsA ? this.posA : this.posB, this.masses, this.matsBuf, this.params);
+
+            renderPass.end();
+            device.queue.submit([commandEncoder.finish()]);
         };
 
         requestAnimationFrame(frame);
@@ -241,8 +240,8 @@ export class NBodySimulation {
             <div style="margin-top:6px;">
               <label>Pipeline:
                 <select id="pipeline">
-                  <option value="direct_sum">Direct Sum</option>
-                  <option value="barnes_hut" selected>Barnes-Hut</option>
+                  <option value="direct_sum" ${this.pipelineName === 'direct_sum' ? 'selected' : ''}>Direct Sum</option>
+                  <option value="barnes_hut" ${this.pipelineName === 'barnes_hut' ? 'selected' : ''}>Barnes-Hut</option>
                 </select>
               </label>
             </div>
