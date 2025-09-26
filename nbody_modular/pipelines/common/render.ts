@@ -9,7 +9,7 @@ export class RenderModule {
     private bindGroupLayout: GPUBindGroupLayout | null = null;
 
     public async init(device: GPUDevice, format: GPUTextureFormat): Promise<void> {
-        const shaderCode = await fetch('./shaders/render-debug.wgsl').then(res => res.text());
+        const shaderCode = await fetch('./pipelines/common/shaders/render-debug.wgsl').then(res => res.text());
         const shaderModule = device.createShaderModule({ code: shaderCode });
 
         this.pipeline = device.createRenderPipeline({

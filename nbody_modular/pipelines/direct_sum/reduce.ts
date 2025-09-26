@@ -9,7 +9,7 @@ export class ReduceModule {
     private bindGroupLayout: GPUBindGroupLayout | null = null;
 
     public async init(device: GPUDevice): Promise<void> {
-        const shaderCode = await fetch('./shaders/reduce-debug.wgsl').then(res => res.text());
+        const shaderCode = await fetch('./pipelines/direct_sum/shaders/reduce-debug.wgsl').then(res => res.text());
         const shaderModule = device.createShaderModule({ code: shaderCode });
 
         this.pipeline = device.createComputePipeline({

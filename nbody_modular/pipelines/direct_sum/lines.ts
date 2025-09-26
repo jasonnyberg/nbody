@@ -10,7 +10,7 @@ export class LinesModule {
     private bindGroupLayout: GPUBindGroupLayout | null = null;
 
     public async init(device: GPUDevice, format: GPUTextureFormat): Promise<void> {
-        const shaderCode = await fetch('./shaders/lines-debug.wgsl').then(res => res.text());
+        const shaderCode = await fetch('./pipelines/direct_sum/shaders/lines-debug.wgsl').then(res => res.text());
         const shaderModule = device.createShaderModule({ code: shaderCode });
 
         this.pipeline = device.createRenderPipeline({

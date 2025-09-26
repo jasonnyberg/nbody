@@ -1,14 +1,10 @@
 import { WebGPUContext } from './common/webgpu-context.js';
 import { OrbitCamera } from './common/camera.js';
 import { mat4 } from './common/gl-matrix-util.js';
+import { IPipeline } from './pipelines/pipeline.js';
+import { DirectSumPipeline } from './pipelines/direct_sum/DirectSumPipeline.js';
 
-import { IntegrateModule } from './modules/integrate.js';
-import { RenderModule } from './modules/render.js';
-import { ReduceModule } from './modules/reduce.js';
-import { LinesModule } from './modules/lines.js';
-import { BoxesModule } from './modules/boxes.js';
-
-interface SimParams {
+export interface SimParams {
     particleCount: number;
     g: number;
     dt: number;
@@ -32,14 +28,9 @@ export class NBodySimulation {
     private paused: boolean;
     private stepRequested: boolean;
 
-    // Modules
-    private integrateModule!: IntegrateModule;
-    private renderModule!: RenderModule;
-    private reduceModule!: ReduceModule;
-    private linesModule!: LinesModule;
-    private boxesModule!: BoxesModule;
+    private activePipeline!: IPipeline;
 
-    // Buffers
+    // Core Buffers
     private posA!: GPUBuffer; private posB!: GPUBuffer;
     private velA!: GPUBuffer; private velB!: GPUBuffer;
     private masses!: GPUBuffer;
@@ -49,10 +40,6 @@ export class NBodySimulation {
     private spinBuf!: GPUBuffer;
     private dampBuf!: GPUBuffer;
     private matsBuf!: GPUBuffer;
-    private nodeBuf!: GPUBuffer;
-    private nodeParamsBuf!: GPUBuffer;
-    private visPairBuf!: GPUBuffer;
-    private outPairCountBuf!: GPUBuffer;
 
     private posIsA: boolean;
 
@@ -93,21 +80,8 @@ export class NBodySimulation {
         this.createBuffers();
         this.setupUI();
 
-        // Initialize modules
-        this.integrateModule = new IntegrateModule();
-        await this.integrateModule.init(device, this.params.wgSize);
-
-        this.renderModule = new RenderModule();
-        await this.renderModule.init(device, format);
-
-        this.reduceModule = new ReduceModule();
-        await this.reduceModule.init(device);
-
-        this.linesModule = new LinesModule();
-        await this.linesModule.init(device, format);
-
-        this.boxesModule = new BoxesModule();
-        await this.boxesModule.init(device, format, this.params.bucketCount);
+        this.activePipeline = new DirectSumPipeline();
+        await this.activePipeline.init(device, format, this.params);
 
         console.log("N-Body Simulation Initialized");
     }
@@ -160,23 +134,6 @@ export class NBodySimulation {
         this.spinBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.dampBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         this.matsBuf = device.createBuffer({ size: 40 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-
-        this.nodeBuf = device.createBuffer({ size: this.params.bucketCount * 2 * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-        this.nodeParamsBuf = buf(new Float32Array([particleCount, bucketSize, this.params.bucketCount, 0]), GPUBufferUsage.UNIFORM);
-        this.visPairBuf = device.createBuffer({ size: this.params.maxPairs * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-        this.outPairCountBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-
-        const allPairs = new Uint32Array(this.params.maxPairs * 4);
-        let pIdx = 0;
-        for (let i = 0; i < particleCount; i++) {
-            for (let j = i + 1; j < particleCount; j++) {
-                const o = pIdx * 4;
-                allPairs[o] = i; allPairs[o + 1] = j;
-                pIdx++;
-            }
-        }
-        device.queue.writeBuffer(this.visPairBuf, 0, allPairs);
-        device.queue.writeBuffer(this.outPairCountBuf, 0, new Uint32Array([pIdx]));
     }
 
     private updateUniforms(): void {
@@ -217,26 +174,18 @@ export class NBodySimulation {
 
                 const commandEncoder = device.createCommandEncoder();
 
-                const computePass = commandEncoder.beginComputePass();
-                const integrateBG = this.integrateModule.createBindGroup(device, {
+                this.activePipeline.run(commandEncoder, {
                     posIn: this.posIsA ? this.posA : this.posB,
                     velIn: this.posIsA ? this.velA : this.velB,
                     posOut: this.posIsA ? this.posB : this.posA,
                     velOut: this.posIsA ? this.velB : this.velA,
-                    simParams: this.simParamsBuf, masses: this.masses, damp: this.dampBuf,
-                    repulse: this.repulseBuf, rad: this.radBuf, spin: this.spinBuf
-                });
-                this.integrateModule.run(computePass, integrateBG, this.params.particleCount, this.params.wgSize);
-                computePass.end();
-
-                const reducePass = commandEncoder.beginComputePass();
-                const reduceBG = this.reduceModule.createBindGroup(device, {
-                    pos: this.posIsA ? this.posB : this.posA,
-                    node: this.nodeBuf,
-                    nodeParams: this.nodeParamsBuf
-                });
-                this.reduceModule.run(reducePass, reduceBG, this.params.bucketCount);
-                reducePass.end();
+                    masses: this.masses,
+                    simParams: this.simParamsBuf,
+                    damp: this.dampBuf,
+                    repulse: this.repulseBuf,
+                    rad: this.radBuf,
+                    spin: this.spinBuf,
+                }, this.params);
 
                 const renderPass = commandEncoder.beginRenderPass({
                     colorAttachments: [{
@@ -246,26 +195,7 @@ export class NBodySimulation {
                     }]
                 });
 
-                const renderBG = this.renderModule.createBindGroup(device, {
-                    pos: this.posIsA ? this.posB : this.posA,
-                    masses: this.masses,
-                    mats: this.matsBuf
-                });
-                this.renderModule.run(renderPass, renderBG, this.params.particleCount);
-
-                const linesBG = this.linesModule.createBindGroup(device, {
-                    pos: this.posIsA ? this.posB : this.posA,
-                    visPair: this.visPairBuf,
-                    mats: this.matsBuf,
-                    outPairCount: this.outPairCountBuf
-                });
-                this.linesModule.run(renderPass, linesBG, this.params.maxPairs);
-
-                const boxesBG = this.boxesModule.createBindGroup(device, { 
-                    node: this.nodeBuf, 
-                    mats: this.matsBuf 
-                });
-                this.boxesModule.run(renderPass, boxesBG, this.params.bucketCount);
+                this.activePipeline.render(renderPass, this.posIsA ? this.posB : this.posA, this.masses, this.matsBuf, this.params);
 
                 renderPass.end();
                 device.queue.submit([commandEncoder.finish()]);
@@ -299,6 +229,14 @@ export class NBodySimulation {
               <button id="startStop">Pause</button>
               <button id="step">Step</button>
             </div>
+            <div style="margin-top:6px;">
+              <label>Pipeline:
+                <select id="pipeline">
+                  <option value="direct_sum" selected>Direct Sum</option>
+                  <option value="barnes_hut" disabled>Barnes-Hut (Not Implemented)</option>
+                </select>
+              </label>
+            </div>
         `;
 
         const setupSlider = (id: string, labelId: string, key: keyof SimParams) => {
@@ -328,6 +266,11 @@ export class NBodySimulation {
                 (document.getElementById('startStop') as HTMLButtonElement).textContent = 'Start';
             }
             this.stepRequested = true;
+        });
+
+        document.getElementById('pipeline')?.addEventListener('change', (e) => {
+            const selectedPipeline = (e.target as HTMLSelectElement).value;
+            // TODO: Implement pipeline switching logic
         });
     }
 }

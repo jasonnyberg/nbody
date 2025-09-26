@@ -8,7 +8,7 @@ export class BoxesModule {
     private bindGroupLayout: GPUBindGroupLayout | null = null;
 
     public async init(device: GPUDevice, format: GPUTextureFormat, bucketCount: number): Promise<void> {
-        const shaderCode = await fetch('./shaders/boxes-debug.wgsl').then(res => res.text());
+        const shaderCode = await fetch('./pipelines/direct_sum/shaders/boxes-debug.wgsl').then(res => res.text());
         const shaderModule = device.createShaderModule({
             code: shaderCode.replace(/\$\{bucketCount\}/g, bucketCount.toString())
         });

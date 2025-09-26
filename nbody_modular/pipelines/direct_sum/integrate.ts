@@ -16,7 +16,7 @@ export class IntegrateModule {
     private bindGroupLayout: GPUBindGroupLayout | null = null;
 
     public async init(device: GPUDevice, wgSize: number): Promise<void> {
-        const shaderCode = await fetch('./shaders/integrate-debug.wgsl').then(res => res.text());
+        const shaderCode = await fetch('./pipelines/direct_sum/shaders/integrate-debug.wgsl').then(res => res.text());
         const shaderModule = device.createShaderModule({
             code: shaderCode.replace(/\$\{WG_SIZE\}/g, wgSize.toString())
         });
