@@ -31,6 +31,7 @@ export class NBodySimulation {
 
     private activePipeline!: IPipeline;
     private pipelineName: string = 'barnes_hut';
+    private frameId: number | null = null;
 
     // Core Buffers
     private posA!: GPUBuffer; private posB!: GPUBuffer;
@@ -70,7 +71,18 @@ export class NBodySimulation {
     }
 
     public async init(): Promise<void> {
-        await this.webgpuContext.init();
+        if (this.frameId) {
+            cancelAnimationFrame(this.frameId);
+            this.frameId = null;
+        }
+
+        if (this.activePipeline) {
+            this.activePipeline.destroy();
+        }
+
+        if (!this.webgpuContext.device) {
+            await this.webgpuContext.init();
+        }
         const { device, format } = this.webgpuContext;
 
         if (!device || !format) {
@@ -93,6 +105,8 @@ export class NBodySimulation {
         await this.activePipeline.init(device, format, this.params);
 
         console.log(`N-Body Simulation Initialized with ${this.pipelineName} pipeline`);
+
+        this.run();
     }
 
     private createBuffers(): void {
@@ -171,7 +185,7 @@ export class NBodySimulation {
 
     public run(): void {
         const frame = () => {
-            requestAnimationFrame(frame);
+            this.frameId = requestAnimationFrame(frame);
 
             const { device, context } = this.webgpuContext;
             if (!device || !context) {
@@ -214,8 +228,7 @@ export class NBodySimulation {
             renderPass.end();
             device.queue.submit([commandEncoder.finish()]);
         };
-
-        requestAnimationFrame(frame);
+        this.frameId = requestAnimationFrame(frame);
     }
 
     private setupUI(): void {

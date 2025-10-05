@@ -114,4 +114,11 @@ export class DirectSumPipeline implements IPipeline {
         });
         this.boxesModule.run(renderPass, boxesBG, params.bucketCount);
     }
+
+    public destroy(): void {
+        this.nodeBuf.destroy();
+        this.nodeParamsBuf.destroy();
+        this.visPairBuf.destroy();
+        this.outPairCountBuf.destroy();
+    }
 }

@@ -17,4 +17,5 @@ export interface IPipeline {
     init(device: GPUDevice, format: GPUTextureFormat, params: SimParams): Promise<void>;
     run(commandEncoder: GPUCommandEncoder, buffers: PipelineInput, params: SimParams): void;
     render(renderPass: GPURenderPassEncoder, pos: GPUBuffer, masses: GPUBuffer, mats: GPUBuffer, params: SimParams): void;
+    destroy(): void;
 }

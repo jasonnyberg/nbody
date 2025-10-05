@@ -29,7 +29,7 @@ fn vs(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VSO
   let proj = loadMat(0u);
   let view = loadMat(1u);
   o.pos = proj * view * vec4f(P, 1.0);
-  o.col = vec4f(0.3, 0.3, 0.3, 0.5); // Dim gray for pairs
+  o.col = vec4f(1.0, 1.0, 0.0, 1.0); // Dim gray for pairs
   return o;
 }
 

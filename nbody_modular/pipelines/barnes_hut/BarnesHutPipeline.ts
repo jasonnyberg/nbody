@@ -4,6 +4,7 @@ import { RenderModule } from "../common/render.js";
 import { RenderMortonModule } from "./RenderMortonModule.js";
 import { UniqueNodesModule } from "./UniqueNodesModule.js";
 import { UniqueBoxesModule } from "./UniqueBoxesModule.js";
+import { IntegrateModule } from "../direct_sum/integrate.js";
 
 export class BarnesHutPipeline implements IPipeline {
     private device!: GPUDevice;
@@ -12,6 +13,7 @@ export class BarnesHutPipeline implements IPipeline {
     private renderMortonModule!: RenderMortonModule;
     private uniqueNodesModule!: UniqueNodesModule;
     private uniqueBoxesModule!: UniqueBoxesModule;
+    private integrateModule!: IntegrateModule;
 
     // Global bounds reduction
     private globalBoundsPass1Pipeline!: GPUComputePipeline;
@@ -49,6 +51,9 @@ export class BarnesHutPipeline implements IPipeline {
 
         this.uniqueBoxesModule = new UniqueBoxesModule();
         await this.uniqueBoxesModule.init(device, format);
+
+        this.integrateModule = new IntegrateModule();
+        await this.integrateModule.init(device, params.wgSize);
 
         const wgSize = 256;
         this.numWorkgroups = Math.ceil(params.particleCount / wgSize);
@@ -241,20 +246,32 @@ export class BarnesHutPipeline implements IPipeline {
         uniqueNodesPass.dispatchWorkgroups(Math.ceil(params.particleCount / 256));
         uniqueNodesPass.end();
 
-        // For now, the Barnes-Hut pipeline does not include an integrator.
-        // I will just copy the input to the output.
-        commandEncoder.copyBufferToBuffer(buffers.posIn, 0, buffers.posOut, 0, params.particleCount * 4 * 4);
-        commandEncoder.copyBufferToBuffer(buffers.velIn, 0, buffers.velOut, 0, params.particleCount * 4 * 4);
+        // For now, use the direct sum integrator
+        const integrateBG = this.integrateModule.createBindGroup(this.device, {
+            posIn: buffers.posIn,
+            velIn: buffers.velIn,
+            posOut: buffers.posOut,
+            velOut: buffers.velOut,
+            simParams: buffers.simParams,
+            masses: buffers.masses,
+            damp: buffers.damp,
+            repulse: buffers.repulse,
+            rad: buffers.rad,
+            spin: buffers.spin,
+        });
+        const computePass = commandEncoder.beginComputePass();
+        this.integrateModule.run(computePass, integrateBG, params.particleCount, params.wgSize);
+        computePass.end();
     }
 
     public render(renderPass: GPURenderPassEncoder, pos: GPUBuffer, masses: GPUBuffer, mats: GPUBuffer, params: SimParams): void {
-        // Render particles sorted by morton code
-        const renderMortonBG = this.renderMortonModule.createBindGroup(this.device, {
-            particles: pos,
-            mortonCodes: this.mortonCodeBuf,
+        // Render particles
+        const renderBG = this.renderModule.createBindGroup(this.device, {
+            pos: pos,
+            masses: masses,
             mats: mats,
         });
-        this.renderMortonModule.run(renderPass, renderMortonBG, params.particleCount);
+        this.renderModule.run(renderPass, renderBG, params.particleCount);
 
         // Render unique boxes
         const uniqueBoxesBG = this.uniqueBoxesModule.createBindGroup(this.device, {
@@ -264,5 +281,16 @@ export class BarnesHutPipeline implements IPipeline {
         });
         const numNodes = 1 << (3 * this.octreeLevel);
         this.uniqueBoxesModule.run(renderPass, uniqueBoxesBG, numNodes);
+    }
+
+    public destroy(): void {
+        this.partialBoundsBuf.destroy();
+        this.globalBoundsBuf.destroy();
+        this.simParamsUniformBuf.destroy();
+        this.mortonCodeBuf.destroy();
+        this.mortonParamsBuf.destroy();
+        this.sortParamsUniformBuf.destroy();
+        this.nodeFlagsBuf.destroy();
+        this.uniqueNodesParamsBuf.destroy();
     }
 }
