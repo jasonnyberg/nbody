@@ -22,8 +22,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    let morton_code = morton_codes.data[i].x;
-    let level_code = morton_code >> (3u * (10u - params.level));
+    let current_code = morton_codes.data[i].x;
 
-    atomicStore(&node_flags.flags[level_code], 1u);
+    if (i == 0u) {
+        atomicStore(&node_flags.flags[current_code], 1u);
+        return;
+    }
+
+    let prev_code = morton_codes.data[i - 1u].x;
+
+    if (current_code != prev_code) {
+        atomicStore(&node_flags.flags[current_code], 1u);
+    }
 }

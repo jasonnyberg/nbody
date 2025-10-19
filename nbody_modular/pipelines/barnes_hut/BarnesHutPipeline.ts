@@ -18,6 +18,7 @@ export class BarnesHutPipeline implements IPipeline {
     // Global bounds reduction
     private globalBoundsPass1Pipeline!: GPUComputePipeline;
     private globalBoundsPass2Pipeline!: GPUComputePipeline;
+    private cubifyBoundsPipeline!: GPUComputePipeline;
     private partialBoundsBuf!: GPUBuffer;
     private globalBoundsBuf!: GPUBuffer;
     private simParamsUniformBuf!: GPUBuffer;
@@ -96,10 +97,21 @@ export class BarnesHutPipeline implements IPipeline {
             },
         });
 
+        const cubifyBoundsShader = await fetch('./pipelines/barnes_hut/shaders/cubify_bounds.wgsl').then(res => res.text());
+        const cubifyBoundsModule = device.createShaderModule({ code: cubifyBoundsShader });
+
+        this.cubifyBoundsPipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: cubifyBoundsModule,
+                entryPoint: 'main',
+            },
+        });
+
         // Morton code pipeline
         this.mortonCodeBuf = device.createBuffer({
             size: params.particleCount * 2 * 4, // vec2<u32>
-            usage: GPUBufferUsage.STORAGE,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
         });
 
         const mortonShader = await fetch('./pipelines/barnes_hut/shaders/morton.wgsl').then(res => res.text());
@@ -115,12 +127,10 @@ export class BarnesHutPipeline implements IPipeline {
 
         const mortonParams = new Float32Array([
             this.octreeLevel, 0, 0, 0, // level
-            -1000, -1000, -1000, 0, // scene_min
-            1000, 1000, 1000, 0, // scene_max
         ]);
         this.mortonParamsBuf = device.createBuffer({
-            size: mortonParams.byteLength,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: mortonParams.byteLength + 32, // room for scene_min and scene_max
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
         device.queue.writeBuffer(this.mortonParamsBuf, 0, mortonParams);
 
@@ -156,11 +166,10 @@ export class BarnesHutPipeline implements IPipeline {
         device.queue.writeBuffer(this.uniqueNodesParamsBuf, 0, uniqueNodesParams);
     }
 
-    public run(commandEncoder: GPUCommandEncoder, buffers: PipelineInput, params: SimParams): void {
+    public run(commandEncoder: GPUCommandEncoder, buffers: PipelineInput, params: SimParams, frameCount?: number): void {
         const wgSize = 256;
         const numWorkgroups = Math.ceil(params.particleCount / wgSize);
 
-        // Pass 1: Reduce in workgroups
         const pass1 = commandEncoder.beginComputePass();
         pass1.setPipeline(this.globalBoundsPass1Pipeline);
         this.device.queue.writeBuffer(this.simParamsUniformBuf, 0, new Uint32Array([params.particleCount]));
@@ -176,7 +185,6 @@ export class BarnesHutPipeline implements IPipeline {
         pass1.dispatchWorkgroups(numWorkgroups);
         pass1.end();
 
-        // Pass 2: Reduce the partial bounds
         const pass2 = commandEncoder.beginComputePass();
         pass2.setPipeline(this.globalBoundsPass2Pipeline);
         this.device.queue.writeBuffer(this.simParamsUniformBuf, 0, new Uint32Array([numWorkgroups]));
@@ -192,6 +200,53 @@ export class BarnesHutPipeline implements IPipeline {
         pass2.dispatchWorkgroups(1);
         pass2.end();
 
+        const cubifyPass = commandEncoder.beginComputePass();
+        cubifyPass.setPipeline(this.cubifyBoundsPipeline);
+        const cubifyBG = this.device.createBindGroup({
+            layout: this.cubifyBoundsPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: this.globalBoundsBuf } },
+            ],
+        });
+        cubifyPass.setBindGroup(0, cubifyBG);
+        cubifyPass.dispatchWorkgroups(1);
+        cubifyPass.end();
+
+
+
+        commandEncoder.copyBufferToBuffer(
+            this.globalBoundsBuf, 0,
+            this.mortonParamsBuf, 16, // offset for vec4 level
+            32 // size of 2 vec4s
+        );
+
+        if (frameCount === 5) {
+            const stagingBuffer = this.device.createBuffer({
+                size: this.mortonParamsBuf.size,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            });
+
+            commandEncoder.copyBufferToBuffer(
+                this.mortonParamsBuf, 0,
+                stagingBuffer, 0,
+                this.mortonParamsBuf.size
+            );
+
+            this.device.queue.onSubmittedWorkDone().then(() => {
+                stagingBuffer.mapAsync(GPUMapMode.READ).then(() => {
+                    const data = new Float32Array(stagingBuffer.getMappedRange());
+                    console.log("Morton params (frame 5):");
+                    console.log(`  level: ${data[0]}`);
+                    console.log(`  scene_min: ${data[4]}, ${data[5]}, ${data[6]}`);
+                    console.log(`  scene_max: ${data[8]}, ${data[9]}, ${data[10]}`);
+                    stagingBuffer.unmap();
+                    stagingBuffer.destroy();
+                });
+            });
+        }
+
+
+
         // Morton code pass
         const mortonPass = commandEncoder.beginComputePass();
         mortonPass.setPipeline(this.mortonCodePipeline);
@@ -201,7 +256,7 @@ export class BarnesHutPipeline implements IPipeline {
             entries: [
                 { binding: 0, resource: { buffer: buffers.posIn } },
                 { binding: 1, resource: { buffer: this.mortonCodeBuf } },
-                { binding: 2, resource: { buffer: this.globalBoundsBuf } },
+                { binding: 2, resource: { buffer: this.mortonParamsBuf } },
                 { binding: 3, resource: { buffer: this.simParamsUniformBuf } },
             ],
         });
@@ -232,6 +287,10 @@ export class BarnesHutPipeline implements IPipeline {
             }
         }
         sortPass.end();
+
+
+
+
 
         // Unique nodes pass
         commandEncoder.clearBuffer(this.nodeFlagsBuf);

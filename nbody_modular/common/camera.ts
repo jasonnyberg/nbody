@@ -42,7 +42,7 @@ export class OrbitCamera {
             lastX = e.clientX;
             lastY = e.clientY;
 
-            this.azimuth += dx * 0.005;
+            this.azimuth -= dx * 0.005;
             this.elevation += dy * 0.005;
             this.elevation = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, this.elevation));
         });

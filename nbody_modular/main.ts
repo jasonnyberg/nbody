@@ -32,6 +32,7 @@ export class NBodySimulation {
     private activePipeline!: IPipeline;
     private pipelineName: string = 'barnes_hut';
     private frameId: number | null = null;
+    private frameCount: number = 0;
 
     // Core Buffers
     private posA!: GPUBuffer; private posB!: GPUBuffer;
@@ -209,7 +210,7 @@ export class NBodySimulation {
                     repulse: this.repulseBuf,
                     rad: this.radBuf,
                     spin: this.spinBuf,
-                }, this.params);
+                }, this.params, this.frameCount++);
 
                 this.posIsA = !this.posIsA;
                 this.stepRequested = false;

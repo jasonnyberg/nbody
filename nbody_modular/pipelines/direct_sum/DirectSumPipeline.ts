@@ -65,7 +65,7 @@ export class DirectSumPipeline implements IPipeline {
         device.queue.writeBuffer(this.outPairCountBuf, 0, new Uint32Array([pIdx]));
     }
 
-    public run(commandEncoder: GPUCommandEncoder, buffers: PipelineInput, params: SimParams): void {
+    public run(commandEncoder: GPUCommandEncoder, buffers: PipelineInput, params: SimParams, frameCount?: number): void {
         const computePass = commandEncoder.beginComputePass();
 
         const integrateBG = this.integrateModule.createBindGroup(this.device, {

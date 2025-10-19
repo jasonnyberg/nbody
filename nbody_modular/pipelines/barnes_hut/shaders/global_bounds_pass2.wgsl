@@ -38,7 +38,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation
     }
 
     if (lid.x == 0) {
-        global_bounds.data[0] = vec4<f32>(local_min[0], 0.0);
-        global_bounds.data[1] = vec4<f32>(local_max[0], 0.0);
+        let scene_min = local_min[0];
+        let scene_max = local_max[0];
+
+        let center = (scene_min + scene_max) * 0.5;
+        let extent = (scene_max - scene_min) * 0.5;
+        let max_extent = max(extent.x, max(extent.y, extent.z));
+
+        global_bounds.data[0] = vec4<f32>(center - max_extent, 0.0);
+        global_bounds.data[1] = vec4<f32>(center + max_extent, 0.0);
     }
 }
